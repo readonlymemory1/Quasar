@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "example": {
+      "command": "python",
+      "args": [
+        "path/to/your_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}

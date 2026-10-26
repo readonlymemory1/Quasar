@@ -1,0 +1,12 @@
+.env
+.mcp.json
+.quasar/
+todolist.sqlite3
+todolist.sqlite3-shm
+todolist.sqlite3-wal
+todolist_desktop/__pycache__/
+todolist_desktop/build/
+todolist_desktop/*.spec
+todolist_desktop/QuasarTodo.exe
+vscode_extension/*.vsix
+"Quasar.py" 

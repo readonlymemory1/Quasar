@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f8">
+  <title>오늘의 할 일</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #202534;
+      --muted: #757d8e;
+      --line: #e8eaf0;
+      --accent: #5b61e8;
+      --accent-soft: #efefff;
+      --surface: #fff;
+      --background: #f5f6fa;
+      --danger: #c43e55;
+      font-family: Inter, "Segoe UI", "Malgun Gothic", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { min-width: 320px; margin: 0; background: var(--background); color: var(--ink); }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+      outline: 3px solid #a9aaff; outline-offset: 2px;
+    }
+    .app { width: min(980px, calc(100% - 36px)); margin: 54px auto; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { display: grid; width: 44px; height: 44px; place-items: center; border-radius: 14px; background: var(--accent); color: white; font-size: 22px; font-weight: 800; }
+    h1 { margin: 0; font-size: clamp(25px, 4vw, 32px); letter-spacing: -1.2px; }
+    .subtitle { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+    .quasar-badge { padding: 9px 13px; border: 1px solid #dedfff; border-radius: 999px; background: var(--accent-soft); color: #4c51c9; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 20px; }
+    .summary-card { padding: 17px 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
+    .summary-card span { display: block; color: var(--muted); font-size: 13px; }
+    .summary-card strong { display: block; margin-top: 5px; font-size: 25px; letter-spacing: -.5px; }
+    .panel { padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: 0 12px 34px #242c4810; }
+    .add-form { display: grid; grid-template-columns: minmax(150px, 1fr) 150px 140px auto; gap: 10px; }
+    input, select, textarea { min-width: 0; padding: 11px 12px; border: 1px solid #dfe2ea; border-radius: 10px; background: white; color: var(--ink); }
+    input::placeholder, textarea::placeholder { color: #9aa0ad; }
+    .primary, .secondary, .icon-button { border: 0; border-radius: 10px; font-weight: 700; }
+    .primary { padding: 11px 18px; background: var(--accent); color: white; }
+    .primary:hover { background: #4e54d6; }
+    .filters { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 25px 0 14px; }
+    .filter-list { display: flex; gap: 7px; }
+    .filter { padding: 8px 13px; border: 0; border-radius: 9px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 700; }
+    .filter[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+    .task-count { color: var(--muted); font-size: 13px; }
+    .task-list { display: grid; gap: 10px; }
+    .task { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 13px; padding: 16px; border: 1px solid var(--line); border-radius: 13px; }
+    .task input[type="checkbox"] { width: 19px; height: 19px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+    .task-main { min-width: 0; }
+    .task-title { overflow-wrap: anywhere; font-size: 15px; font-weight: 700; }
+    .task.completed .task-title { color: #969baa; text-decoration: line-through; }
+    .task-description { margin-top: 4px; color: var(--muted); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .task-meta { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+    .chip { padding: 3px 8px; border-radius: 999px; background: #f1f2f6; color: #61697a; font-size: 11px; font-weight: 700; }
+    .chip.high { background: #fff0f1; color: #b73950; }
+    .chip.medium { background: #fff6e6; color: #9a6816; }
+    .chip.low { background: #eef7f1; color: #33744c; }
+    .task-actions { display: flex; gap: 6px; }
+    .icon-button { padding: 8px 10px; background: #f3f4f8; color: #51596b; font-size: 12px; }
+    .icon-button:hover { background: #e9eaf2; }
+    .icon-button.delete { color: var(--danger); }
+    .empty { padding: 55px 16px; color: var(--muted); text-align: center; }
+    .empty strong { display: block; margin-bottom: 5px; color: var(--ink); font-size: 17px; }
+    .notice { min-height: 22px; margin-top: 14px; color: var(--danger); font-size: 13px; }
+    dialog { width: min(480px, calc(100% - 32px)); padding: 24px; border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 20px 70px #11182730; }
+    dialog::backdrop { background: #20253466; }
+    dialog h2 { margin: 0 0 18px; font-size: 20px; }
+    .edit-fields { display: grid; gap: 12px; }
+    .edit-fields label { display: grid; gap: 6px; color: #525a6b; font-size: 13px; font-weight: 700; }
+    .edit-fields textarea { min-height: 90px; resize: vertical; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+    .secondary { padding: 10px 15px; background: #f0f1f5; color: #535b6c; }
+    @media (max-width: 720px) {
+      .app { margin: 28px auto; }
+      .add-form { grid-template-columns: 1fr 1fr; }
+      .add-form input:first-child { grid-column: 1 / -1; }
+      .add-form .primary { grid-column: 1 / -1; }
+    }
+    @media (max-width: 500px) {
+      .topbar { align-items: flex-start; }
+      .quasar-badge { max-width: 145px; white-space: normal; text-align: center; }
+      .summary { gap: 8px; }
+      .summary-card { padding: 13px 11px; }
+      .summary-card strong { font-size: 21px; }
+      .panel { padding: 15px; }
+      .task { grid-template-columns: 22px minmax(0, 1fr); padding: 13px; }
+      .task-actions { grid-column: 2; }
+      .filters { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">✓</div>
+        <div>
+          <h1>오늘의 할 일</h1>
+          <p class="subtitle">작은 한 걸음씩, 차근차근 해내요.</p>
+        </div>
+      </div>
+      <div class="quasar-badge">Quasar와 목록 공유 중</div>
+    </header>
+
+    <section class="summary" aria-label="할 일 요약">
+      <div class="summary-card"><span>전체</span><strong id="total-count">0</strong></div>
+      <div class="summary-card"><span>진행 중</span><strong id="active-count">0</strong></div>
+      <div class="summary-card"><span>완료</span><strong id="completed-count">0</strong></div>
+    </section>
+
+    <section class="panel" aria-label="할 일 관리">
+      <form id="add-form" class="add-form">
+        <input id="new-title" name="title" maxlength="200" placeholder="새로운 할 일을 입력하세요" aria-label="할 일 제목" required>
+        <input id="new-due-date" name="due_date" type="date" aria-label="마감일">
+        <select id="new-priority" name="priority" aria-label="우선순위">
+          <option value="medium">보통 우선순위</option>
+          <option value="high">높은 우선순위</option>
+          <option value="low">낮은 우선순위</option>
+        </select>
+        <button class="primary" type="submit">할 일 추가</button>
+      </form>
+      <div class="filters" aria-label="할 일 필터">
+        <div class="filter-list">
+          <button class="filter" type="button" data-filter="all" aria-pressed="true">전체</button>
+          <button class="filter" type="button" data-filter="active" aria-pressed="false">진행 중</button>
+          <button class="filter" type="button" data-filter="completed" aria-pressed="false">완료</button>
+        </div>
+        <span id="task-count" class="task-count" aria-live="polite"></span>
+      </div>
+      <div id="task-list" class="task-list" aria-live="polite"></div>
+      <div id="notice" class="notice" role="status"></div>
+    </section>
+  </main>
+
+  <dialog id="edit-dialog" aria-labelledby="edit-heading">
+    <form id="edit-form">
+      <h2 id="edit-heading">할 일 수정</h2>
+      <div class="edit-fields">
+        <label>제목<input name="title" maxlength="200" required></label>
+        <label>메모<textarea name="description" maxlength="2000"></textarea></label>
+        <label>마감일<input name="due_date" type="date"></label>
+        <label>우선순위
+          <select name="priority">
+            <option value="low">낮음</option>
+            <option value="medium">보통</option>
+            <option value="high">높음</option>
+          </select>
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button class="secondary" type="button" id="cancel-edit">취소</button>
+        <button class="primary" type="submit">저장</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    const taskList = document.querySelector("#task-list");
+    const notice = document.querySelector("#notice");
+    const editDialog = document.querySelector("#edit-dialog");
+    const editForm = document.querySelector("#edit-form");
+    let tasks = [];
+    let filter = "all";
+    let editingTaskId = null;
+
+    async function request(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { "Content-Type": "application/json", ...options.headers }
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "요청을 처리하지 못했습니다.");
+      return result;
+    }
+
+    function showError(error) {
+      notice.textContent = error.message;
+    }
+
+    function makeElement(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined) element.textContent = text;
+      return element;
+    }
+
+    function render() {
+      document.querySelector("#total-count").textContent = tasks.length;
+      document.querySelector("#active-count").textContent = tasks.filter(task => !task.completed).length;
+      document.querySelector("#completed-count").textContent = tasks.filter(task => task.completed).length;
+      document.querySelector("#task-count").textContent = `${tasks.length}개의 할 일`;
+      document.querySelectorAll("[data-filter]").forEach(button => {
+        button.setAttribute("aria-pressed", String(button.dataset.filter === filter));
+      });
+      const visibleTasks = tasks.filter(task =>
+        filter === "all" || (filter === "active" && !task.completed) || (filter === "completed" && task.completed)
+      );
+      taskList.replaceChildren();
+      if (!visibleTasks.length) {
+        const empty = makeElement("div", "empty");
+        empty.append(makeElement("strong", "", filter === "completed" ? "완료한 일이 아직 없어요" : "아직 할 일이 없어요"));
+        empty.append(makeElement("span", "", "위 입력란에서 첫 번째 할 일을 추가해 보세요."));
+        taskList.append(empty);
+        return;
+      }
+
+      for (const task of visibleTasks) {
+        const row = makeElement("article", `task${task.completed ? " completed" : ""}`);
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = task.completed;
+        checkbox.dataset.action = "toggle";
+        checkbox.dataset.id = task.id;
+        checkbox.setAttribute("aria-label", `${task.title} 완료 여부`);
+        const content = makeElement("div", "task-main");
+        content.append(makeElement("div", "task-title", task.title));
+        if (task.description) content.append(makeElement("div", "task-description", task.description));
+        const meta = makeElement("div", "task-meta");
+        meta.append(makeElement("span", `chip ${task.priority}`, `우선순위 ${({ low: "낮음", medium: "보통", high: "높음" })[task.priority]}`));
+        if (task.due_date) meta.append(makeElement("span", "chip", `마감 ${task.due_date}`));
+        content.append(meta);
+        const actions = makeElement("div", "task-actions");
+        const editButton = makeElement("button", "icon-button", "수정");
+        editButton.type = "button";
+        editButton.dataset.action = "edit";
+        editButton.dataset.id = task.id;
+        const deleteButton = makeElement("button", "icon-button delete", "삭제");
+        deleteButton.type = "button";
+        deleteButton.dataset.action = "delete";
+        deleteButton.dataset.id = task.id;
+        actions.append(editButton, deleteButton);
+        row.append(checkbox, content, actions);
+        taskList.append(row);
+      }
+    }
+
+    async function loadTasks() {
+      notice.textContent = "";
+      const result = await request("/api/todos");
+      tasks = result.tasks;
+      render();
+    }
+
+    document.querySelector("#add-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const data = new FormData(form);
+      try {
+        await request("/api/todos", {
+          method: "POST",
+          body: JSON.stringify({
+            title: data.get("title"),
+            due_date: data.get("due_date") || null,
+            priority: data.get("priority")
+          })
+        });
+        form.reset();
+        document.querySelector("#new-title").focus();
+        await loadTasks();
+      } catch (error) { showError(error); }
+    });
+
+    document.querySelector(".filter-list").addEventListener("click", event => {
+      const button = event.target.closest("[data-filter]");
+      if (!button) return;
+      filter = button.dataset.filter;
+      render();
+    });
+
+    taskList.addEventListener("change", async event => {
+      if (event.target.dataset.action !== "toggle") return;
+      try {
+        await request(`/api/todos/${event.target.dataset.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ completed: event.target.checked })
+        });
+        await loadTasks();
+      } catch (error) { showError(error); }
+    });
+
+    taskList.addEventListener("click", async event => {
+      const button = event.target.closest("[data-action]");
+      if (!button) return;
+      const task = tasks.find(item => String(item.id) === button.dataset.id);
+      if (!task) return;
+      if (button.dataset.action === "edit") {
+        editingTaskId = task.id;
+        editForm.elements.title.value = task.title;
+        editForm.elements.description.value = task.description;
+        editForm.elements.due_date.value = task.due_date || "";
+        editForm.elements.priority.value = task.priority;
+        editDialog.showModal();
+        editForm.elements.title.focus();
+      } else if (button.dataset.action === "delete" && confirm(`"${task.title}" 할 일을 삭제할까요?`)) {
+        try {
+          await request(`/api/todos/${task.id}`, { method: "DELETE" });
+          await loadTasks();
+        } catch (error) { showError(error); }
+      }
+    });
+
+    editForm.addEventListener("submit", async event => {
+      event.preventDefault();
+      const data = new FormData(editForm);
+      try {
+        await request(`/api/todos/${editingTaskId}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            title: data.get("title"),
+            description: data.get("description"),
+            due_date: data.get("due_date") || null,
+            priority: data.get("priority")
+          })
+        });
+        editDialog.close();
+        await loadTasks();
+      } catch (error) { showError(error); }
+    });
+
+    document.querySelector("#cancel-edit").addEventListener("click", () => editDialog.close());
+    loadTasks().catch(showError);
+    window.setInterval(() => {
+      if (!document.hidden) loadTasks().catch(showError);
+    }, 5000);
+  </script>
+</body>
+</html>

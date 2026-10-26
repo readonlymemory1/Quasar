@@ -1,0 +1,5 @@
+{
+  "poll_interval_seconds": 10,
+  "stable_seconds": 10,
+  "idle_seconds": 20
+}

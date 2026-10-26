@@ -1,0 +1,35 @@
+{
+  "name": "quasar-live-analysis",
+  "displayName": "Quasar Live Analysis",
+  "description": "Streams the active Python editor buffer to a local Quasar session for live syntax analysis.",
+  "version": "0.1.0",
+  "publisher": "quasar-local",
+  "files": [
+    "extension.js",
+    "package.json"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:quasar.connectLiveAnalysis",
+    "onCommand:quasar.disconnectLiveAnalysis"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "quasar.connectLiveAnalysis",
+        "title": "Quasar: Connect Live Analysis"
+      },
+      {
+        "command": "quasar.disconnectLiveAnalysis",
+        "title": "Quasar: Disconnect Live Analysis"
+      }
+    ]
+  }
+}

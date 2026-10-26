@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body { margin: 0; background: transparent; font: 13px sans-serif; color: #8ea3a5; }
+    #mic { width: 100%; padding: 8px 10px; border: 1px solid rgba(151,190,188,.16); border-radius: 6px; color: #edf4f4; background: #172527; cursor: pointer; font: inherit; }
+    #mic.active { color: #081312; background: #80e0c2; border-color: #80e0c2; }
+  </style>
+</head>
+<body tabindex="0">
+  <button id="mic" type="button">🎙️ 녹음 시작</button>
+  <script>
+    const mic = document.getElementById("mic");
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+    let listening = false;
+    let transcript = "";
+    let sent = false;
+    let retryCount = 0;
+    let restartTimer = null;
+
+    function sendValue(value) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: value
+      }, "*");
+    }
+
+    function startListening() {
+      if (listening || !SpeechRecognition) return;
+      transcript = "";
+      sent = false;
+      retryCount = 0;
+      listening = true;
+      recognition = new SpeechRecognition();
+      recognition.lang = "ko-KR";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.onresult = (event) => {
+        transcript = Array.from(event.results).map(result => result[0].transcript).join("");
+      };
+      recognition.onerror = (event) => {
+        if (event.error === "network" && listening && retryCount < 3) {
+          retryCount += 1;
+          mic.textContent = `연결 재시도 중... (${retryCount}/3)`;
+          restartTimer = setTimeout(() => {
+            if (listening) startRecognition();
+          }, 700 * retryCount);
+          return;
+        }
+        mic.textContent = event.error === "not-allowed"
+          ? "마이크 권한을 허용해 주세요"
+          : `음성 인식 오류: ${event.error}`;
+      };
+      recognition.onend = () => {
+        if (listening && retryCount < 3) {
+          restartTimer = setTimeout(startRecognition, 300);
+        }
+      };
+      startRecognition();
+    }
+
+    function startRecognition() {
+      if (!recognition || !listening) return;
+      try {
+        recognition.start();
+      } catch (error) {
+        if (listening) {
+          restartTimer = setTimeout(startRecognition, 500);
+        }
+        return;
+      }
+      mic.className = "active";
+      mic.textContent = "● 듣는 중... 다시 눌러 전송";
+    }
+
+    function stopListening() {
+      if (!listening) return;
+      listening = false;
+      clearTimeout(restartTimer);
+      if (recognition) recognition.stop();
+      mic.className = "";
+      mic.textContent = "🎙️ 녹음 시작";
+      setTimeout(() => {
+        if (!sent && transcript.trim()) {
+          sent = true;
+          sendValue(transcript.trim());
+        }
+      }, 250);
+    }
+
+    mic.addEventListener("click", () => {
+      if (listening) {
+        stopListening();
+      } else {
+        startListening();
+      }
+    });
+
+    window.addEventListener("load", () => {
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 38 }, "*");
+      document.body.focus();
+    });
+  </script>
+</body>
+</html>
