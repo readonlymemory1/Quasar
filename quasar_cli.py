@@ -36,6 +36,8 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import ImageGrab
+from rich.console import Console
+from rich.markdown import Markdown
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -53,6 +55,7 @@ if platform.system() == "Windows":
 load_dotenv(Path(__file__).with_name(".env"))
 
 current_directory = Path.cwd().resolve()
+console = Console()
 browser = None
 chrome_process: subprocess.Popen[bytes] | None = None
 scheduled_jobs: list[dict[str, str]] = []
@@ -84,6 +87,11 @@ DEBUG_INLINE_SECRET_PATTERN = re.compile(
     r"\s*(?:[:=]\s*|\s+)|\b[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)=|"
     r"--(?:password|token|secret|api[_-]?key)(?:=|\s+))([^\s,;]+)"
 )
+
+
+def print_markdown_response(answer: str) -> None:
+    console.print("\n[bold cyan]Quasar:[/bold cyan]")
+    console.print(Markdown(answer))
 
 
 def load_collaboration_settings(config_path: Path) -> dict[str, int]:
@@ -1939,6 +1947,7 @@ TOOLS = [
     tool_schema("python_check_syntax", "Check the syntax of a Python file in the workspace without running it.", {"file_path": {"type": "string"}}, ["file_path"]),
     tool_schema("python_run_file", "Run a Python file in the workspace when execution is enabled, with a 30-second timeout.", {"file_path": {"type": "string"}}, ["file_path"]),
     tool_schema("discover_mcp_tools", "Search connected MCP tools when a request needs an integration not covered by the available tools. Provide an English query describing the required capability. Matching tool schemas will be available in the next step.", {"query": {"type": "string", "description": "English keywords for the needed tool or capability."}}, ["query"]),
+    tool_schema("message_to_user", "Send a brief progress update or error notice directly to the user while the task is in progress.", {"message": {"type": "string"}, "kind": {"type": "string", "enum": ["progress", "error"]}}, ["message"]),
     tool_schema("end", "Immediately finish the current agent task and return final_response to the user. Call when the task is complete or blocked; no further tools will run for this task.", {"final_response": {"type": "string", "description": "The concise final result, including any remaining blocker."}}, ["final_response"]),
 ]
 
@@ -1949,6 +1958,16 @@ def run_tool(
     live_analysis_server: CliLiveAnalysisServer | None = None,
     mcp_manager: MCPServerManager | None = None,
 ) -> str | tuple[str, int, int]:
+    if name == "message_to_user":
+        message = arguments.get("message")
+        kind = arguments.get("kind", "progress")
+        if not isinstance(message, str) or not message.strip():
+            return "사용자 메시지 전송 실패: message는 비어 있지 않은 문자열이어야 합니다."
+        if not isinstance(kind, str) or kind not in {"progress", "error"}:
+            return f"사용자 메시지 전송 실패: 지원하지 않는 메시지 종류입니다 ({kind})."
+        label = "오류" if kind == "error" else "진행"
+        print(f"\nQuasar ({label}): {message.strip()}", flush=True)
+        return "메시지를 사용자에게 전달했습니다."
     if mcp_manager is not None and name in mcp_manager.tools:
         try:
             return mcp_manager.call_tool(name, arguments)
@@ -2053,7 +2072,9 @@ def run_tool(
 
 
 def print_tool_status(name: str, mcp_manager: MCPServerManager | None) -> None:
-    if name == "discover_mcp_tools":
+    if name == "message_to_user":
+        label = "사용자 메시지 전송"
+    elif name == "discover_mcp_tools":
         label = "Searching MCP tools"
     elif mcp_manager is not None and name in mcp_manager.tools:
         connection, original_name, _ = mcp_manager.tools[name]
@@ -2582,34 +2603,93 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as error:
         parser.error(str(error))
 
+    # 기존 시스템 프롬프트:
+    # system_prompt = (
+    #     "You are Quasar, a business-automation CLI agent. Understand requests and answer clearly in Korean. Use tools when "
+    #     "useful; answer greetings directly. Never expose tool JSON, schemas, or internal routing. Run Python only when enabled. "
+    #     "For workspace documents, search with rag_search (index first with rag_index_documents if needed), cite source paths, "
+    #     "and do not invent facts. Prefer the active VS Code file; do not summarize unrelated workspace content. "
+    #     "For coding, pair program and ask only if ambiguity changes the implementation. Read files with read_workspace_file "
+    #     "before editing; save with write_workspace_file and the exact expected_source. Create files only on explicit request. "
+    #     "Do not use VS Code editor tools for edits, run unrelated commands, or claim unverified results; report conflicts/failures. "
+    #     "Use web_search for independent public-web searches; it must not open or change the controlled Chrome session. "
+    #     "When asked to open or go to a URL, use web_navigate directly and report its actual result; do not substitute a search result link "
+    #     "or claim a browser-control limitation without trying the tool. Use web_click, web_input, web_scroll, and related tools "
+    #     "only to interact with the current Chrome page. "
+    #     "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
+    #     "Never promise to retry or claim success without a new tool result; if a tool fails, stop and report that failure instead "
+    #     "of saying you will try again. For web_input, inspect the returned result and do not claim text was entered or sent unless verified. "
+    #     "For every agent task, once the requested work is complete, stop all further work and immediately call end with the final result. "
+    #     "If the task is blocked and no safe or useful action remains, immediately call end with the blocker and what was not completed. "
+    #     "Do not continue with unrelated improvements, extra tool calls, or promises of future work after completion. "
+    #     "This ends only the current agent task; keep the CLI session available for the user's next request. "
+    #     "Use rag_search only for indexed workspace documents; it is not web search. Use discover_mcp_tools with an English "
+    #     "capability query only when an integration is needed. For non-code files, call the "
+    #     "matching tool and confirm output/path before claiming success. After all work, call end last with an accurate "
+    #     "final_response, including failures. Keep follow-ups in context; do not re-ask an agreed diagnosis. "
+    #     "Send email only on explicit request; otherwise draft. Gmail uses Quasar's Chrome profile; ask for sign-in via /gmail "
+    #     "if needed. Do not replace browser requests with screenshot analysis; base visual analysis on attached screenshots. "
+    #     "The working directory persists between commands. Manage the shared Todo app with todo_list, todo_add, "
+    #     "todo_update, and todo_delete; the web app and Quasar use the same local SQLite database. Use these tools "
+    #     "for todo requests and confirm their result before reporting a change."
+    # )
+    tool_descriptions = (
+        "- todo_list: 할 일 목록 조회\n"
+        "- todo_add: 할 일 추가\n"
+        "- todo_update: 할 일 수정 또는 완료 상태 변경\n"
+        "- todo_delete: 할 일 삭제\n"
+        "- execute_cmd: 작업 폴더에서 시스템 명령 실행\n"
+        "- rag_index_documents: 문서를 검색용으로 색인\n"
+        "- rag_search: 색인된 문서 검색\n"
+        "- web_search: 공개 웹 검색\n"
+        "- web_navigate: Chrome에서 URL 열기\n"
+        "- web_click: 현재 페이지의 요소 클릭\n"
+        "- web_input: 현재 페이지 입력란에 텍스트 입력\n"
+        "- web_scroll: 현재 페이지 스크롤\n"
+        "- web_back: Chrome에서 이전 페이지로 이동\n"
+        "- web_key_press: 현재 포커스된 요소에 키 입력\n"
+        "- gmail_open: Gmail 받은편지함 열기\n"
+        "- gmail_search: Gmail 메일 검색\n"
+        "- gmail_create_draft: Gmail 초안 작성\n"
+        "- gmail_send: Gmail 메일 발송\n"
+        "- get_current_time: 현재 날짜와 시간 조회\n"
+        "- create_calendar_event: 캘린더 이벤트 파일 생성 및 열기\n"
+        "- schedule_command: 지정한 시각에 명령 예약\n"
+        "- set_timer: 타이머 설정\n"
+        "- set_alarm: 알람 설정\n"
+        "- capture_screen: 현재 화면 캡처\n"
+        "- vscode_open: VS Code에서 파일 또는 폴더 열기\n"
+        "- python_list_files: 작업 폴더의 Python 파일 목록 조회\n"
+        "- python_read_file: Python 파일 읽기\n"
+        "- read_workspace_file: 작업 폴더의 텍스트 파일 읽기\n"
+        "- write_workspace_file: 작업 폴더의 텍스트 파일 생성 또는 수정\n"
+        "- python_check_syntax: Python 파일 문법 검사\n"
+        "- python_run_file: Python 파일 실행\n"
+        "- discover_mcp_tools: 연결된 MCP 도구 검색\n"
+        "- message_to_user: 작업 중 진행 상황 또는 오류 메시지 전달\n"
+        "- end: 현재 요청을 마치고 최종 응답 반환\n"
+        "- MCP 도구: 검색 결과로 제공된 외부 연동 도구 실행"
+    )
     system_prompt = (
         "You are Quasar, a business-automation CLI agent. Understand requests and answer clearly in Korean. Use tools when "
-        "useful; answer greetings directly. Never expose tool JSON, schemas, or internal routing. Run Python only when enabled. "
-        "For workspace documents, search with rag_search (index first with rag_index_documents if needed), cite source paths, "
-        "and do not invent facts. Prefer the active VS Code file; do not summarize unrelated workspace content. "
-        "For coding, pair program and ask only if ambiguity changes the implementation. Read files with read_workspace_file "
-        "before editing; save with write_workspace_file and the exact expected_source. Create files only on explicit request. "
-        "Do not use VS Code editor tools for edits, run unrelated commands, or claim unverified results; report conflicts/failures. "
-        "Use web_search for independent public-web searches; it must not open or change the controlled Chrome session. "
-        "When asked to open or go to a URL, use web_navigate directly and report its actual result; do not substitute a search result link "
-        "or claim a browser-control limitation without trying the tool. Use web_click, web_input, web_scroll, and related tools "
-        "only to interact with the current Chrome page. "
-        "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
-        "Never promise to retry or claim success without a new tool result; if a tool fails, stop and report that failure instead "
-        "of saying you will try again. For web_input, inspect the returned result and do not claim text was entered or sent unless verified. "
+        "useful; answer greetings directly. Never expose tool JSON, schemas, or internal routing. Run Python only when enabled.\n\n"
+        "작업을 시작할 때 요청별 최종 목표를 정하고, 목표를 달성할 수 있는 작고 구체적인 하위 목표로 나누어 순서대로 진행하세요. "
+        "여러 단계 작업은 목표와 하위 목표를 사용자에게 간결하게 먼저 알리고 각 단계의 결과를 확인하세요. "
+        "간단한 단일 작업이나 질문에는 불필요한 계획을 출력하지 말고 바로 처리하세요.\n\n"
+        "작업 중간에 사용자에게 진행 상황이나 오류를 알려야 할 때는 일반 텍스트를 출력하지 말고 message_to_user 도구를 호출하세요. "
+        "긴 작업은 중요한 단계 전후에 간결한 진행 메시지를 보내고, 도구 실패 시 원인과 복구 시도 내용을 오류 메시지로 알리세요. "
+        "도구 실행 결과가 실패를 나타내면 즉시 포기하지 말고, 가능한 진단 도구를 활용해 원인을 파악한 뒤 안전한 수정 방법을 찾아 적용하고 결과를 검증하세요. "
+        "같은 도구를 같은 인자와 방법으로 무의미하게 반복하지 말고, 새 정보에 따라 접근을 바꾸세요. "
+        "데이터 삭제, 외부 발송 등 되돌리기 어렵거나 영향이 큰 조치를 재시도하기 전에 필요한 사용자 확인을 받으세요. "
+        "도구 반복 한도 안에서 복구를 시도하고, 더 진행할 방법이 없거나 안전하지 않으면 실패 원인과 미완료 사항을 분명히 보고하세요.\n\n"
+        "사용 가능한 도구:\n"
+        f"{tool_descriptions}\n\n"
+        "Never claim success without a confirming tool result. For web_input, inspect the returned result and do not claim text was entered or sent unless verified. "
         "For every agent task, once the requested work is complete, stop all further work and immediately call end with the final result. "
         "If the task is blocked and no safe or useful action remains, immediately call end with the blocker and what was not completed. "
         "Do not continue with unrelated improvements, extra tool calls, or promises of future work after completion. "
         "This ends only the current agent task; keep the CLI session available for the user's next request. "
-        "Use rag_search only for indexed workspace documents; it is not web search. Use discover_mcp_tools with an English "
-        "capability query only when an integration is needed. For non-code files, call the "
-        "matching tool and confirm output/path before claiming success. After all work, call end last with an accurate "
-        "final_response, including failures. Keep follow-ups in context; do not re-ask an agreed diagnosis. "
-        "Send email only on explicit request; otherwise draft. Gmail uses Quasar's Chrome profile; ask for sign-in via /gmail "
-        "if needed. Do not replace browser requests with screenshot analysis; base visual analysis on attached screenshots. "
-        "The working directory persists between commands. Manage the shared Todo app with todo_list, todo_add, "
-        "todo_update, and todo_delete; the web app and Quasar use the same local SQLite database. Use these tools "
-        "for todo requests and confirm their result before reporting a change."
+        "After all work, call end last with an accurate final_response, including failures."
     )
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     try:
@@ -2663,7 +2743,7 @@ def main(argv: list[str] | None = None) -> None:
                     live_analysis_server,
                     mcp_manager,
                 )
-                print(f"\nQuasar: {answer}")
+                print_markdown_response(answer)
             except Exception as error:
                 print(f"\n요청 처리 실패: {error}", file=sys.stderr)
     finally:
