@@ -1,4 +1,4 @@
-from quasar_cli import main
+from Quasar import main
 
 
 if __name__ == "__main__":

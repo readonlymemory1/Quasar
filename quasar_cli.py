@@ -58,6 +58,12 @@ current_directory = Path.cwd().resolve()
 console = Console()
 browser = None
 chrome_process: subprocess.Popen[bytes] | None = None
+browser_user_window_handle: str | None = None
+browser_ai_window_handles: list[str] = []
+browser_active_window_handle: str | None = None
+browser_tab_ids: dict[str, str] = {}
+browser_tab_owners: dict[str, str] = {}
+browser_next_tab_id = 1
 scheduled_jobs: list[dict[str, str]] = []
 auto_approve_commands = True
 allow_python_run = False
@@ -118,9 +124,26 @@ def load_collaboration_settings(config_path: Path) -> dict[str, int]:
     return defaults
 
 
+def resolve_mcp_config_path(
+    configured_path: str | None,
+    workspace_directory: Path,
+    application_directory: Path,
+) -> Path:
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        return path if path.is_absolute() else workspace_directory / path
+
+    workspace_config = workspace_directory / ".mcp.json"
+    if workspace_config.is_file():
+        return workspace_config
+
+    application_config = application_directory / ".mcp.json"
+    return application_config if application_config.is_file() else workspace_config
+
+
 def create_client(provider: str, model_override: str | None = None) -> tuple[OpenAI, str]:
     if provider == "ollama":
-        model = model_override or os.getenv("OLLAMA_MODEL", "qwen3:8b")
+        model = model_override or os.getenv("OLLAMA_MODEL", "gemma4:cloud")
         client = OpenAI(
             api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
@@ -1118,8 +1141,9 @@ def capture_screen() -> tuple[str, int, int]:
 
 
 def get_browser():
-    global browser, chrome_process
+    global browser, chrome_process, browser_user_window_handle, browser_active_window_handle
     if browser is None:
+        _reset_browser_tab_state()
         profile_directory = current_directory / ".quasar" / "chrome-profile"
         profile_directory.mkdir(parents=True, exist_ok=True)
         chrome_paths = [
@@ -1180,7 +1204,106 @@ def get_browser():
             chrome_process = None
             raise
         browser.implicitly_wait(0)
+        handles = browser.window_handles
+        if not handles:
+            raise RuntimeError("Quasar Chrome started without an available tab.")
+        browser_user_window_handle = handles[0]
+        _register_browser_tab(browser_user_window_handle, "user")
+        browser.switch_to.new_window("tab")
+        browser_active_window_handle = browser.current_window_handle
+        _register_browser_tab(browser_active_window_handle, "ai")
+    else:
+        _sync_browser_tabs(browser)
+        if browser_active_window_handle not in browser.window_handles:
+            if not browser_ai_window_handles:
+                browser.switch_to.new_window("tab")
+                browser_active_window_handle = browser.current_window_handle
+                _register_browser_tab(browser_active_window_handle, "ai")
+            else:
+                browser_active_window_handle = browser_ai_window_handles[-1]
+        browser.switch_to.window(browser_active_window_handle)
     return browser
+
+
+def _reset_browser_tab_state() -> None:
+    global browser_user_window_handle, browser_active_window_handle, browser_next_tab_id
+    browser_user_window_handle = None
+    browser_active_window_handle = None
+    browser_next_tab_id = 1
+    browser_ai_window_handles.clear()
+    browser_tab_ids.clear()
+    browser_tab_owners.clear()
+
+
+def _register_browser_tab(window_handle: str, owner: str) -> str:
+    global browser_next_tab_id
+    tab_id = browser_tab_ids.get(window_handle)
+    if tab_id is None:
+        tab_id = f"tab-{browser_next_tab_id}"
+        browser_next_tab_id += 1
+        browser_tab_ids[window_handle] = tab_id
+        browser_tab_owners[window_handle] = owner
+    if browser_tab_owners[window_handle] == "ai" and window_handle not in browser_ai_window_handles:
+        browser_ai_window_handles.append(window_handle)
+    return tab_id
+
+
+def _sync_browser_tabs(page) -> None:
+    handles = page.window_handles
+    if not handles:
+        raise RuntimeError("Quasar Chrome has no open tabs.")
+    open_handles = set(handles)
+    for window_handle in list(browser_tab_ids):
+        if window_handle not in open_handles:
+            browser_tab_ids.pop(window_handle)
+            browser_tab_owners.pop(window_handle, None)
+            if window_handle in browser_ai_window_handles:
+                browser_ai_window_handles.remove(window_handle)
+    for window_handle in handles:
+        if window_handle not in browser_tab_ids:
+            _register_browser_tab(window_handle, "user")
+
+
+def web_list_tabs() -> str:
+    try:
+        page = get_browser()
+        active_handle = browser_active_window_handle
+        tabs = []
+        for index, window_handle in enumerate(page.window_handles, start=1):
+            page.switch_to.window(window_handle)
+            tab_id = _register_browser_tab(
+                window_handle,
+                "ai" if window_handle in browser_ai_window_handles else "user",
+            )
+            owner = "AI" if browser_tab_owners[window_handle] == "ai" else "사용자"
+            title = page.title.strip() or "(제목 없음)"
+            tabs.append(f"{index}. {tab_id} [{owner}] {title}\n  {page.current_url}")
+        if active_handle in page.window_handles:
+            page.switch_to.window(active_handle)
+        return "열린 탭 목록:\n" + "\n".join(tabs)
+    except Exception as error:
+        return f"탭 목록 조회 실패: {type(error).__name__}: {error}"
+
+
+def web_switch_tab(tab_id: str) -> str:
+    global browser_active_window_handle
+    try:
+        page = get_browser()
+        window_handle = next(
+            (
+                handle for handle in page.window_handles
+                if browser_tab_ids.get(handle) == tab_id
+            ),
+            None,
+        )
+        if window_handle is None:
+            return f"탭 전환 실패: '{tab_id}'는 열린 탭이 아닙니다. web_list_tabs로 탭 ID를 확인해 주세요."
+        page.switch_to.window(window_handle)
+        browser_active_window_handle = window_handle
+        owner = "AI" if browser_tab_owners[window_handle] == "ai" else "사용자 지정"
+        return f"탭 전환 완료: {tab_id} ({owner})\n제목: {page.title}\n현재 URL: {page.current_url}"
+    except Exception as error:
+        return f"탭 전환 실패: {type(error).__name__}: {error}"
 
 
 def close_browser() -> None:
@@ -1192,6 +1315,7 @@ def close_browser() -> None:
         chrome_process.terminate()
         chrome_process.wait(timeout=5)
     chrome_process = None
+    _reset_browser_tab_state()
 
 
 class DuckDuckGoResultsParser(HTMLParser):
@@ -1287,26 +1411,53 @@ def web_search(query: str) -> str:
         return f"웹 검색 실패: {error}"
 
 
-def web_navigate(url: str) -> str:
+def _web_url_validation_error(url: str) -> str | None:
     if not isinstance(url, str) or not url.strip():
-        return "페이지 이동 실패: URL을 입력해 주세요."
+        return "URL을 입력해 주세요."
     url = url.strip()
     if any(character.isspace() for character in url):
-        return "페이지 이동 실패: URL에 공백을 포함할 수 없습니다."
+        return "URL에 공백을 포함할 수 없습니다."
     try:
         parsed_url = urlsplit(url)
     except ValueError as error:
-        return f"페이지 이동 실패: 잘못된 URL입니다 ({error})."
+        return f"잘못된 URL입니다 ({error})."
     if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.hostname:
-        return "페이지 이동 실패: http:// 또는 https://로 시작하는 전체 URL을 입력해 주세요."
+        return "http:// 또는 https://로 시작하는 전체 URL을 입력해 주세요."
     if parsed_url.username is not None or parsed_url.password is not None:
-        return "페이지 이동 실패: 계정 정보가 포함된 URL은 열 수 없습니다."
+        return "계정 정보가 포함된 URL은 열 수 없습니다."
+    return None
+
+
+def web_navigate(url: str) -> str:
+    validation_error = _web_url_validation_error(url)
+    if validation_error:
+        return f"페이지 이동 실패: {validation_error}"
+    url = url.strip()
     try:
         page = get_browser()
         page.get(url)
-        return f"페이지 이동 완료\n제목: {page.title}\n현재 URL: {page.current_url}"
+        tab_id = browser_tab_ids.get(browser_active_window_handle or "", "탭")
+        return f"페이지 이동 완료 ({tab_id})\n제목: {page.title}\n현재 URL: {page.current_url}"
     except Exception as error:
         return f"페이지 이동 실패 ({url}): {type(error).__name__}: {error}"
+
+
+def web_open_new_tab(url: str) -> str:
+    global browser_active_window_handle
+    validation_error = _web_url_validation_error(url)
+    if validation_error:
+        return f"새 탭 열기 실패: {validation_error}"
+    url = url.strip()
+    try:
+        page = get_browser()
+        page.switch_to.new_window("tab")
+        window_handle = page.current_window_handle
+        tab_id = _register_browser_tab(window_handle, "ai")
+        browser_active_window_handle = window_handle
+        page.get(url)
+        return f"새 탭 열기 완료 (AI 탭 {tab_id})\n제목: {page.title}\n현재 URL: {page.current_url}"
+    except Exception as error:
+        return f"새 탭 열기 실패 ({url}): {type(error).__name__}: {error}"
 
 
 def web_click(css_selector: str) -> str:
@@ -1924,6 +2075,9 @@ TOOLS = [
     tool_schema("rag_search", "Search indexed workspace documents for content relevant to a question. Use before answering questions based on workspace documents.", {"query": {"type": "string"}, "top_k": {"type": "integer"}}, ["query"]),
     tool_schema("web_search", "Search the public web independently of the controlled Chrome session and return up to five DuckDuckGo results.", {"query": {"type": "string"}}, ["query"]),
     tool_schema("web_navigate", "Navigate Quasar's controlled Chrome browser directly to an http or https URL and report the resulting page title and URL.", {"url": {"type": "string"}}, ["url"]),
+    tool_schema("web_open_new_tab", "Open an http or https URL in a new AI-owned tab in Quasar's controlled Chrome browser and report its tab ID, title, and URL.", {"url": {"type": "string"}}, ["url"]),
+    tool_schema("web_list_tabs", "List all open tabs in order with stable IDs, titles, URLs, and user/AI ownership. Use this to identify the tab the user specified before browser actions.", {}, []),
+    tool_schema("web_switch_tab", "Switch the active browser context to any open tab using its tab ID from web_list_tabs. Use this when the user specifies a tab; subsequent browser actions operate in that tab.", {"tab_id": {"type": "string"}}, ["tab_id"]),
     tool_schema("web_click", "Click an element on the current page using a CSS selector.", {"css_selector": {"type": "string"}}, ["css_selector"]),
     tool_schema("web_input", "Enter text into a web input selected by CSS selector and optionally press Enter.", {"css_selector": {"type": "string"}, "text": {"type": "string"}, "press_enter": {"type": "boolean"}}, ["css_selector", "text"]),
     tool_schema("web_scroll", "Scroll the current Chrome page up or down.", {"direction": {"type": "string", "enum": ["up", "down"]}}, ["direction"]),
@@ -2017,6 +2171,12 @@ def run_tool(
         return web_search(arguments["query"])
     if name == "web_navigate":
         return web_navigate(arguments["url"])
+    if name == "web_open_new_tab":
+        return web_open_new_tab(arguments["url"])
+    if name == "web_list_tabs":
+        return web_list_tabs()
+    if name == "web_switch_tab":
+        return web_switch_tab(arguments["tab_id"])
     if name == "web_click":
         return web_click(arguments["css_selector"])
     if name == "web_input":
@@ -2149,7 +2309,8 @@ def print_help() -> None:
         "  /exit             종료\n"
         "코드는 자연어로 요청하고 후속 대화를 이어가며 파일에 직접 수정·저장할 수 있습니다.\n"
         "일반 요청은 Quasar 에이전트가 명령 실행, 웹/Gmail, 일정, 알람, VS Code, Python 및 MCP 도구로 처리합니다.\n"
-        "MCP 서버는 작업 폴더의 .mcp.json에 설정하거나 --mcp-config로 설정 파일을 지정합니다."
+        "MCP 서버는 작업 폴더의 .mcp.json을 우선 사용하고, 없으면 CLI 폴더의 설정을 사용합니다. "
+        "--mcp-config로 설정 파일을 지정할 수도 있습니다."
     )
 
 
@@ -2565,7 +2726,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-model-prompt", action="store_true", help="시작 시 공급자/모델 선택을 건너뜀")
     parser.add_argument("--cwd", help="시작 작업 디렉터리")
     parser.add_argument("--confirm-commands", action="store_true", help="각 시스템 명령 실행 전에 확인")
-    parser.add_argument("--mcp-config", help="MCP 서버 설정 JSON 파일 (기본값: .mcp.json)")
+    parser.add_argument(
+        "--mcp-config",
+        help="MCP 서버 설정 JSON 파일 (기본값: 작업 폴더의 .mcp.json, 없으면 CLI 폴더의 .mcp.json)",
+    )
     args = parser.parse_args(argv)
 
     global current_directory, auto_approve_commands
@@ -2587,9 +2751,11 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"AI 클라이언트 초기화 실패: {error}")
 
     configured_mcp_path = args.mcp_config or os.getenv("MCP_SERVERS_FILE")
-    mcp_config_path = Path(configured_mcp_path).expanduser() if configured_mcp_path else current_directory / ".mcp.json"
-    if not mcp_config_path.is_absolute():
-        mcp_config_path = current_directory / mcp_config_path
+    mcp_config_path = resolve_mcp_config_path(
+        configured_mcp_path,
+        current_directory,
+        Path(__file__).resolve().parent,
+    )
     if configured_mcp_path and not mcp_config_path.is_file():
         parser.error(f"MCP 설정 파일을 찾을 수 없습니다: {mcp_config_path}")
     try:
@@ -2682,9 +2848,24 @@ def main(argv: list[str] | None = None) -> None:
         "같은 도구를 같은 인자와 방법으로 무의미하게 반복하지 말고, 새 정보에 따라 접근을 바꾸세요. "
         "데이터 삭제, 외부 발송 등 되돌리기 어렵거나 영향이 큰 조치를 재시도하기 전에 필요한 사용자 확인을 받으세요. "
         "도구 반복 한도 안에서 복구를 시도하고, 더 진행할 방법이 없거나 안전하지 않으면 실패 원인과 미완료 사항을 분명히 보고하세요.\n\n"
+        "For workspace documents, search with rag_search (index first with rag_index_documents if needed), cite source paths, "
+        "and do not invent facts. Prefer the active VS Code file; do not summarize unrelated workspace content. "
+        "For coding, pair program and ask only if ambiguity changes the implementation. Read files with read_workspace_file "
+        "before editing; save with write_workspace_file and the exact expected_source. Create files only on explicit request. "
+        "Do not use VS Code editor tools for edits, run unrelated commands, or claim unverified results; report conflicts/failures. "
+        "Use web_search for independent public-web searches; it must not open or change the controlled Chrome session. "
+        "When asked to open a URL in a new tab, use web_open_new_tab and report its actual result. "
+        "For other requests to open or go to a URL, use web_navigate directly and report its actual result; do not substitute a search result link "
+        "or claim a browser-control limitation without trying the tool. The controlled Chrome starts with the user's tab first "
+        "and a separate AI-owned tab second. Use web_list_tabs to inspect tab order, stable IDs, titles, URLs, and ownership. "
+        "When the user specifies a tab by number, ID, or title, identify it with web_list_tabs if needed and use "
+        "web_switch_tab before any browser action; keep using that selected tab until the user specifies another. "
+        "If no tab is specified, use the currently selected tab (the AI tab by default). Browser actions operate in the selected tab. "
+        "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
+        "Never promise a retry before making it or claim success without a confirming tool result. For web_input, inspect the returned "
+        "result and do not claim text was entered or sent unless verified. "
         "사용 가능한 도구:\n"
         f"{tool_descriptions}\n\n"
-        "Never claim success without a confirming tool result. For web_input, inspect the returned result and do not claim text was entered or sent unless verified. "
         "For every agent task, once the requested work is complete, stop all further work and immediately call end with the final result. "
         "If the task is blocked and no safe or useful action remains, immediately call end with the blocker and what was not completed. "
         "Do not continue with unrelated improvements, extra tool calls, or promises of future work after completion. "

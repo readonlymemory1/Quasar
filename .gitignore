@@ -10,3 +10,4 @@ todolist_desktop/*.spec
 todolist_desktop/QuasarTodo.exe
 vscode_extension/*.vsix
 "Quasar.py" 
+__pycache__/ 

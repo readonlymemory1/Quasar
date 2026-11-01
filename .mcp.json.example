@@ -6,6 +6,13 @@
         "path/to/your_mcp_server.py"
       ],
       "env": {}
+    },
+    "obsidian": {
+      "command": "uvx",
+      "args": [
+        "mcp-obsidian"
+      ],
+      "env": {}
     }
   }
 }

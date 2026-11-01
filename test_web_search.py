@@ -52,6 +52,94 @@ class WebSearchTests(unittest.TestCase):
         self.assertIn("페이지 이동 완료", result)
         self.assertIn("인천남동고등학교", result)
 
+    def test_open_new_tab_creates_tab_before_navigating(self) -> None:
+        page = Mock()
+        page.title = "Google"
+        page.current_url = "https://www.google.com/"
+        page.current_window_handle = "ai-tab"
+        with (
+            patch.object(quasar_cli, "get_browser", return_value=page) as get_browser,
+            patch.object(quasar_cli, "browser_ai_window_handles", []),
+            patch.object(quasar_cli, "browser_tab_ids", {}),
+            patch.object(quasar_cli, "browser_tab_owners", {}),
+            patch.object(quasar_cli, "browser_active_window_handle", None),
+        ):
+            result = quasar_cli.run_tool("web_open_new_tab", {"url": "https://www.google.com/"})
+
+        get_browser.assert_called_once_with()
+        page.switch_to.new_window.assert_called_once_with("tab")
+        page.get.assert_called_once_with("https://www.google.com/")
+        self.assertIn("새 탭 열기 완료", result)
+        self.assertIn("AI 탭 tab-1", result)
+        self.assertIn("Google", result)
+
+    def test_list_tabs_identifies_user_and_ai_tabs(self) -> None:
+        page = Mock()
+        page.window_handles = ["user-tab", "ai-tab"]
+        page.title = "Example"
+        page.current_url = "https://example.com/"
+        with (
+            patch.object(quasar_cli, "get_browser", return_value=page),
+            patch.object(quasar_cli, "browser_active_window_handle", "ai-tab"),
+            patch.object(quasar_cli, "browser_ai_window_handles", ["ai-tab"]),
+            patch.object(quasar_cli, "browser_tab_ids", {"user-tab": "tab-1", "ai-tab": "tab-2"}),
+            patch.object(quasar_cli, "browser_tab_owners", {"user-tab": "user", "ai-tab": "ai"}),
+        ):
+            result = quasar_cli.web_list_tabs()
+
+        self.assertIn("tab-1 [사용자]", result)
+        self.assertIn("tab-2 [AI]", result)
+        self.assertIn("1. tab-1", result)
+        self.assertIn("2. tab-2", result)
+        page.switch_to.window.assert_any_call("user-tab")
+        page.switch_to.window.assert_any_call("ai-tab")
+        page.switch_to.window.assert_called_with("ai-tab")
+
+    def test_browser_keeps_using_the_user_selected_tab(self) -> None:
+        page = Mock()
+        page.window_handles = ["user-tab", "ai-tab"]
+        with (
+            patch.object(quasar_cli, "browser", page),
+            patch.object(quasar_cli, "browser_active_window_handle", "user-tab"),
+            patch.object(quasar_cli, "browser_ai_window_handles", ["ai-tab"]),
+            patch.object(quasar_cli, "browser_tab_ids", {"user-tab": "tab-1", "ai-tab": "tab-2"}),
+            patch.object(quasar_cli, "browser_tab_owners", {"user-tab": "user", "ai-tab": "ai"}),
+        ):
+            result = quasar_cli.get_browser()
+
+        self.assertIs(result, page)
+        page.switch_to.window.assert_called_once_with("user-tab")
+
+    def test_switch_tab_allows_selected_user_and_ai_tabs(self) -> None:
+        page = Mock()
+        page.window_handles = ["user-tab", "ai-tab"]
+        page.title = "AI page"
+        page.current_url = "https://example.com/"
+        with (
+            patch.object(quasar_cli, "get_browser", return_value=page),
+            patch.object(quasar_cli, "browser_active_window_handle", "ai-tab"),
+            patch.object(quasar_cli, "browser_ai_window_handles", ["ai-tab"]),
+            patch.object(quasar_cli, "browser_tab_ids", {"user-tab": "tab-1", "ai-tab": "tab-2"}),
+            patch.object(quasar_cli, "browser_tab_owners", {"user-tab": "user", "ai-tab": "ai"}),
+        ):
+            result = quasar_cli.web_switch_tab("tab-2")
+            user_result = quasar_cli.web_switch_tab("tab-1")
+            failure = quasar_cli.web_switch_tab("unknown")
+
+        self.assertIn("탭 전환 완료: tab-2 (AI)", result)
+        self.assertIn("사용자 지정", user_result)
+        self.assertIn("탭 전환 실패", failure)
+        self.assertEqual(
+            [call.args[0] for call in page.switch_to.window.call_args_list],
+            ["ai-tab", "user-tab"],
+        )
+
+    def test_open_new_tab_rejects_invalid_urls_without_opening_browser(self) -> None:
+        with patch.object(quasar_cli, "get_browser") as get_browser:
+            self.assertIn("전체 URL", quasar_cli.web_open_new_tab("google.com"))
+            self.assertIn("공백", quasar_cli.web_open_new_tab("https://example.com/bad path"))
+        get_browser.assert_not_called()
+
     def test_navigation_rejects_invalid_or_credentialed_urls(self) -> None:
         with patch.object(quasar_cli, "get_browser") as get_browser:
             self.assertIn("전체 URL", quasar_cli.web_navigate("namdong.icehs.kr"))

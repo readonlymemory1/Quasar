@@ -1,0 +1,15 @@
+python-dotenv
+openai
+PySide6
+Pillow
+rich
+selenium
+webdriver-manager
+mcp
+pandas
+matplotlib
+qiskit
+qiskit-aer
+numpy
+sounddevice
+pyttsx3
