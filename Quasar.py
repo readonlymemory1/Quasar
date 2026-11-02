@@ -51,72 +51,17 @@ ACCENT = "#9b91ff"
 SYSTEM_PROMPT = (
     "You are Quasar. Respond concisely and accurately in Korean. "
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
-    "Run routine commands needed for the user's request without asking for extra confirmation. "
-    "Wait for approval before destructive, privileged, publishing, or scheduled commands. "
+    "Run requested commands without showing confirmation dialogs. "
     "Send email only when explicitly requested, and clarify ambiguous requests first. "
     "Do not claim success until you have verified the tool result."
 )
 
 NEMO_SPEECH_MODEL = "nemotron-3.5"
 
-DANGEROUS_COMMAND_PATTERNS = (
-    (
-        r"(?<![\w.-])(?:rm|rmdir|rd|del|erase|shred|sdelete|format|diskpart|wipe|truncate|remove-item|clear-content|set-content|out-file)\b",
-        "파일이나 디스크의 내용을 삭제하거나 덮어쓸 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:shutdown|stop-computer|restart-computer|reboot|halt|poweroff|logoff)\b",
-        "컴퓨터를 종료하거나 재시작할 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:sudo|doas|runas)\b|start-process\b[^;&|]*-verb\s+runas",
-        "관리자 권한으로 실행할 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:reg(?:\.exe)?\s+(?:add|delete)|sc(?:\.exe)?\s+(?:create|config|delete|stop)|net\s+(?:user|localgroup|stop)|netsh\s+advfirewall|bcdedit|takeown|icacls|set-acl|set-executionpolicy)\b",
-        "Windows 설정, 계정, 서비스 또는 권한을 변경할 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:chmod|chown|mount|umount)\b",
-        "시스템 파일 권한이나 디스크 연결 상태를 변경할 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])git\s+(?:reset\s+--hard|clean\b(?![^\r\n]*(?:--dry-run|(?:^|\s)-n(?:\s|$)))|push\b|branch\s+-D\b|restore\s+--worktree\b)",
-        "Git 변경사항을 삭제하거나 원격 저장소에 반영할 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:npm\s+publish|twine\s+upload|docker\s+push|terraform\s+destroy|kubectl\s+delete|gh\s+release\s+create)\b",
-        "패키지를 배포하거나 원격 인프라를 변경할 수 있습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:powershell|pwsh)\b[^;&|]*-(?:encodedcommand|enc)\b",
-        "인코딩된 스크립트는 내용을 미리 확인하기 어렵습니다.",
-    ),
-    (
-        r"(?<![\w.-])(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir)|Path\.(?:unlink|rmdir))\b",
-        "스크립트에서 파일이나 폴더를 삭제할 수 있습니다.",
-    ),
-    (
-        r"(?:curl|wget|invoke-webrequest|iwr)\b[^;&|]*(?:\||&&|;)[^;&|]*(?:iex|invoke-expression|(?:^|[\s])(?:bash|sh|python|pwsh|powershell)\b)",
-        "인터넷에서 받은 내용을 바로 실행할 수 있습니다.",
-    ),
-)
-
-
-def command_approval_reason(command: str, scheduled: bool = False) -> str | None:
-    if scheduled:
-        return "예약된 명령은 나중에 별도 확인 없이 실행됩니다."
-    for pattern, reason in DANGEROUS_COMMAND_PATTERNS:
-        if re.search(pattern, command, flags=re.IGNORECASE):
-            return reason
-    return None
-
-
 class AppSignals(QObject):
     response_ready = Signal(str)
     request_failed = Signal(str)
     request_progress = Signal(str)
-    approval_requested = Signal(str, str, str, object)
     models_loaded = Signal(str, object, object)
     voice_status = Signal(str)
     voice_text_ready = Signal(str)
@@ -723,7 +668,6 @@ class QuasarDesktopApp(QMainWindow):
         self.busy = False
         self.closing = False
         self.activity_body: QLabel | None = None
-        self.pending_approvals: list[dict[str, Any]] = []
         self.voice_recognizer = LocalSpeechRecognizer()
         self.voice_recording = False
         self.voice_processing = False
@@ -734,7 +678,6 @@ class QuasarDesktopApp(QMainWindow):
         self.signals.response_ready.connect(self._finish_with_response)
         self.signals.request_failed.connect(self._finish_with_error)
         self.signals.request_progress.connect(self._show_request_progress)
-        self.signals.approval_requested.connect(self._show_command_approval)
         self.signals.models_loaded.connect(self._apply_model_options)
         self.signals.voice_status.connect(self._show_voice_status)
         self.signals.voice_text_ready.connect(self._submit_voice_text)
@@ -1197,42 +1140,8 @@ class QuasarDesktopApp(QMainWindow):
 
     def _configure_agent(self) -> None:
         agent.current_directory = Path(__file__).resolve().parent
-        agent.auto_approve_commands = False
-
-        def run_tool_with_approval(
-            name: str,
-            arguments: dict[str, Any],
-            live_analysis_server: Any = None,
-            mcp_manager: Any = None,
-        ) -> Any:
-            if name in {"execute_cmd", "schedule_command"}:
-                command = arguments.get("command", "")
-                action = "실행" if name == "execute_cmd" else "예약"
-                if not isinstance(command, str):
-                    return "명령이 문자열이 아닙니다."
-                reason = command_approval_reason(
-                    command,
-                    scheduled=name == "schedule_command",
-                )
-                if reason and not self._request_command_approval(
-                    command,
-                    action,
-                    reason,
-                ):
-                    return f"명령 {action}이 사용자에 의해 거부되었습니다."
-                previous = agent.auto_approve_commands
-                agent.auto_approve_commands = True
-                try:
-                    return self.original_run_tool(
-                        name, arguments, live_analysis_server, mcp_manager
-                    )
-                finally:
-                    agent.auto_approve_commands = previous
-            return self.original_run_tool(
-                name, arguments, live_analysis_server, mcp_manager
-            )
-
-        agent.run_tool = run_tool_with_approval
+        agent.auto_approve_commands = True
+        agent.run_tool = self.original_run_tool
 
     def submit(self) -> None:
         if self.busy:
@@ -1474,45 +1383,6 @@ class QuasarDesktopApp(QMainWindow):
         )
         return bubble, body
 
-    def _request_command_approval(
-        self,
-        command: str,
-        action: str,
-        reason: str,
-    ) -> bool:
-        decision: dict[str, Any] = {"approved": False, "event": threading.Event()}
-        self.pending_approvals.append(decision)
-        self.signals.approval_requested.emit(command, action, reason, decision)
-        decision["event"].wait()
-        if decision in self.pending_approvals:
-            self.pending_approvals.remove(decision)
-        return bool(decision["approved"]) and not self.closing
-
-    def _show_command_approval(
-        self,
-        command: str,
-        action: str,
-        reason: str,
-        decision: dict[str, Any],
-    ) -> None:
-        if self.closing:
-            decision["event"].set()
-            return
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle(f"명령 {action} 승인")
-        dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setText(f"{reason}\n이 명령을 {action}할까요?")
-        dialog.setInformativeText(command)
-        dialog.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        dialog.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        dialog.setDefaultButton(QMessageBox.StandardButton.No)
-        decision["approved"] = (
-            dialog.exec() == QMessageBox.StandardButton.Yes
-        )
-        decision["event"].set()
-
     def closeEvent(self, event: Any) -> None:
         if self.busy:
             answer = QMessageBox.question(
@@ -1530,9 +1400,6 @@ class QuasarDesktopApp(QMainWindow):
         if self.voice_stop_event is not None:
             self.voice_stop_event.set()
         agent.run_tool = self.original_run_tool
-        for decision in self.pending_approvals:
-            decision["approved"] = False
-            decision["event"].set()
         event.accept()
 
 
