@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 import quasar_cli
+from selenium.common.exceptions import WebDriverException
 
 
 class WebSearchTests(unittest.TestCase):
@@ -135,9 +136,9 @@ class WebSearchTests(unittest.TestCase):
             ),
             patch.object(quasar_cli.subprocess, "Popen", return_value=chrome_process),
             patch.object(
-                quasar_cli.urllib.request,
-                "urlopen",
-                return_value=MagicMock(),
+                quasar_cli,
+                "_chrome_devtools_available",
+                side_effect=[False, True],
             ),
             patch.object(quasar_cli.webdriver, "ChromeOptions", return_value=Mock()),
             patch.object(quasar_cli.webdriver, "Chrome", return_value=page),
@@ -154,6 +155,103 @@ class WebSearchTests(unittest.TestCase):
             self.assertEqual(quasar_cli.browser_ai_window_handles, [])
 
         page.switch_to.new_window.assert_not_called()
+
+    def test_browser_restarts_after_the_controlled_chrome_is_closed(self) -> None:
+        class ClosedBrowser:
+            quit_called = False
+
+            @property
+            def window_handles(self) -> list[str]:
+                raise WebDriverException("disconnected from Chrome")
+
+            def quit(self) -> None:
+                self.quit_called = True
+                raise WebDriverException("disconnected from Chrome")
+
+        closed_browser = ClosedBrowser()
+        page = Mock()
+        page.window_handles = ["reopened-tab"]
+        chrome_process = Mock()
+        chrome_process.poll.return_value = None
+        startup_info = Mock(dwFlags=0)
+
+        with (
+            patch.object(quasar_cli, "browser", closed_browser),
+            patch.object(quasar_cli, "chrome_process", None),
+            patch.object(quasar_cli, "browser_user_window_handle", "old-tab"),
+            patch.object(quasar_cli, "browser_active_window_handle", "old-tab"),
+            patch.object(quasar_cli, "browser_ai_window_handles", ["old-tab"]),
+            patch.object(quasar_cli, "browser_tab_ids", {"old-tab": "tab-1"}),
+            patch.object(quasar_cli, "browser_tab_owners", {"old-tab": "ai"}),
+            patch.object(quasar_cli, "browser_next_tab_id", 2),
+            patch.object(quasar_cli.Path, "is_file", return_value=True),
+            patch.object(quasar_cli.Path, "mkdir"),
+            patch.object(
+                quasar_cli.subprocess,
+                "STARTUPINFO",
+                return_value=startup_info,
+            ),
+            patch.object(quasar_cli.subprocess, "Popen", return_value=chrome_process) as popen,
+            patch.object(
+                quasar_cli,
+                "_chrome_devtools_available",
+                side_effect=[False, True],
+            ),
+            patch.object(quasar_cli.webdriver, "ChromeOptions", return_value=Mock()),
+            patch.object(quasar_cli.webdriver, "Chrome", return_value=page),
+            patch.object(quasar_cli, "ChromeDriverManager") as driver_manager,
+            patch.object(quasar_cli, "Service"),
+        ):
+            driver_manager.return_value.install.return_value = "chromedriver"
+            self.assertIs(quasar_cli.get_browser(), page)
+            self.assertEqual(quasar_cli.browser_user_window_handle, "reopened-tab")
+            self.assertEqual(quasar_cli.browser_active_window_handle, "reopened-tab")
+            self.assertEqual(
+                quasar_cli.browser_tab_owners,
+                {"reopened-tab": "user"},
+            )
+
+        self.assertTrue(closed_browser.quit_called)
+        popen.assert_called_once()
+
+    def test_browser_reattaches_if_chrome_is_open_after_driver_disconnect(self) -> None:
+        class ClosedBrowser:
+            quit_called = False
+
+            @property
+            def window_handles(self) -> list[str]:
+                raise WebDriverException("disconnected from Chrome")
+
+            def quit(self) -> None:
+                self.quit_called = True
+                raise WebDriverException("disconnected from Chrome")
+
+        closed_browser = ClosedBrowser()
+        page = Mock()
+        page.window_handles = ["reopened-tab"]
+
+        with (
+            patch.object(quasar_cli, "browser", closed_browser),
+            patch.object(quasar_cli, "chrome_process", None),
+            patch.object(quasar_cli, "browser_user_window_handle", "old-tab"),
+            patch.object(quasar_cli, "browser_active_window_handle", "old-tab"),
+            patch.object(quasar_cli, "browser_ai_window_handles", []),
+            patch.object(quasar_cli, "browser_tab_ids", {"old-tab": "tab-1"}),
+            patch.object(quasar_cli, "browser_tab_owners", {"old-tab": "user"}),
+            patch.object(quasar_cli, "browser_next_tab_id", 2),
+            patch.object(quasar_cli, "_chrome_devtools_available", return_value=True),
+            patch.object(quasar_cli.webdriver, "ChromeOptions", return_value=Mock()),
+            patch.object(quasar_cli.webdriver, "Chrome", return_value=page),
+            patch.object(quasar_cli, "ChromeDriverManager") as driver_manager,
+            patch.object(quasar_cli, "Service"),
+            patch.object(quasar_cli.subprocess, "Popen") as popen,
+        ):
+            driver_manager.return_value.install.return_value = "chromedriver"
+            self.assertIs(quasar_cli.get_browser(), page)
+            self.assertEqual(quasar_cli.browser_user_window_handle, "reopened-tab")
+
+        popen.assert_not_called()
+        self.assertTrue(closed_browser.quit_called)
 
     def test_browser_does_not_reopen_a_tab_when_the_active_tab_was_closed(self) -> None:
         page = Mock()
@@ -188,7 +286,14 @@ class WebSearchTests(unittest.TestCase):
     def test_browser_does_not_create_a_tab_when_all_tabs_are_closed(self) -> None:
         page = Mock()
         page.window_handles = []
-        with patch.object(quasar_cli, "browser", page):
+        with (
+            patch.object(quasar_cli, "browser", page),
+            patch.object(
+                quasar_cli,
+                "_chrome_devtools_available",
+                return_value=True,
+            ),
+        ):
             with self.assertRaisesRegex(RuntimeError, "no open tabs"):
                 quasar_cli.get_browser()
 

@@ -1140,51 +1140,88 @@ def capture_screen() -> tuple[str, int, int]:
     return image_data, screenshot.width, screenshot.height
 
 
+def _chrome_devtools_available() -> bool:
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:9222/json/version",
+            timeout=1,
+        ) as response:
+            response.read()
+        return True
+    except OSError:
+        return False
+
+
+def _stop_chrome_process() -> None:
+    global chrome_process
+    if chrome_process is not None and chrome_process.poll() is None:
+        chrome_process.terminate()
+        chrome_process.wait(timeout=5)
+    chrome_process = None
+
+
 def get_browser():
     global browser, chrome_process, browser_user_window_handle, browser_active_window_handle
+    if browser is not None:
+        try:
+            if not browser.window_handles:
+                if _chrome_devtools_available():
+                    raise RuntimeError("Quasar Chrome has no open tabs.")
+                raise WebDriverException("Chrome has been closed.")
+        except RuntimeError:
+            raise
+        except WebDriverException:
+            try:
+                browser.quit()
+            except WebDriverException:
+                pass
+            browser = None
+            _reset_browser_tab_state()
+
     if browser is None:
         _reset_browser_tab_state()
-        profile_directory = current_directory / ".quasar" / "chrome-profile"
-        profile_directory.mkdir(parents=True, exist_ok=True)
-        chrome_paths = [
-            Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-        ]
-        chrome_binary = next((path for path in chrome_paths if path.is_file()), None)
-        if chrome_binary is None:
-            raise FileNotFoundError("Google Chrome was not found in the standard Windows installation paths.")
-        startup_info = subprocess.STARTUPINFO()
-        startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup_info.wShowWindow = 4  # SW_SHOWNOACTIVATE
-        chrome_process = subprocess.Popen(
-            [
-                str(chrome_binary),
-                f"--user-data-dir={profile_directory}",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=9222",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "about:blank",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            startupinfo=startup_info,
-        )
-        deadline = time.monotonic() + BROWSER_STARTUP_TIMEOUT_SECONDS
-        while True:
-            if chrome_process.poll() is not None:
-                raise RuntimeError(f"Chrome exited before its DevTools endpoint started (code {chrome_process.returncode}).")
-            try:
-                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1) as response:
-                    response.read()
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    chrome_process.terminate()
-                    chrome_process.wait(timeout=5)
+        started_chrome = False
+        if not _chrome_devtools_available():
+            _stop_chrome_process()
+            profile_directory = current_directory / ".quasar" / "chrome-profile"
+            profile_directory.mkdir(parents=True, exist_ok=True)
+            chrome_paths = [
+                Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+            ]
+            chrome_binary = next((path for path in chrome_paths if path.is_file()), None)
+            if chrome_binary is None:
+                raise FileNotFoundError("Google Chrome was not found in the standard Windows installation paths.")
+            startup_info = subprocess.STARTUPINFO()
+            startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup_info.wShowWindow = 4  # SW_SHOWNOACTIVATE
+            chrome_process = subprocess.Popen(
+                [
+                    str(chrome_binary),
+                    f"--user-data-dir={profile_directory}",
+                    "--remote-debugging-address=127.0.0.1",
+                    "--remote-debugging-port=9222",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "about:blank",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=startup_info,
+            )
+            started_chrome = True
+            deadline = time.monotonic() + BROWSER_STARTUP_TIMEOUT_SECONDS
+            while True:
+                if chrome_process.poll() is not None:
+                    return_code = chrome_process.returncode
                     chrome_process = None
+                    raise RuntimeError(f"Chrome exited before its DevTools endpoint started (code {return_code}).")
+                if _chrome_devtools_available():
+                    break
+                if time.monotonic() >= deadline:
+                    _stop_chrome_process()
                     raise TimeoutError(
                         f"Chrome DevTools endpoint did not start within {BROWSER_STARTUP_TIMEOUT_SECONDS} seconds."
                     )
@@ -1198,10 +1235,8 @@ def get_browser():
                 options=options,
             )
         except WebDriverException:
-            if chrome_process.poll() is None:
-                chrome_process.terminate()
-                chrome_process.wait(timeout=5)
-            chrome_process = None
+            if started_chrome:
+                _stop_chrome_process()
             raise
         browser.implicitly_wait(0)
         handles = browser.window_handles
@@ -1304,14 +1339,16 @@ def web_switch_tab(tab_id: str) -> str:
 
 def close_browser() -> None:
     global browser, chrome_process
-    if browser is not None:
-        browser.quit()
+    try:
+        if browser is not None:
+            try:
+                browser.quit()
+            except WebDriverException:
+                pass
+    finally:
         browser = None
-    if chrome_process is not None and chrome_process.poll() is None:
-        chrome_process.terminate()
-        chrome_process.wait(timeout=5)
-    chrome_process = None
-    _reset_browser_tab_state()
+        _stop_chrome_process()
+        _reset_browser_tab_state()
 
 
 class DuckDuckGoResultsParser(HTMLParser):
