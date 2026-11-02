@@ -2676,8 +2676,8 @@ def _debug_tool_result(name: str, result: Any) -> None:
     print_debug_event("도구 실행 결과", {"tool": name, "result": result})
 
 
-def print_help() -> None:
-    print(
+def print_help(output: Callable[[str], None] = print) -> None:
+    output(
         "\nQuasar CLI 명령:\n"
         "  /help             도움말 표시\n"
         "  /clear            대화 기록 초기화\n"
@@ -2711,21 +2711,23 @@ def handle_cli_command(
     messages: list[dict[str, Any]],
     live_analysis_server: CliLiveAnalysisServer | None = None,
     collaboration_monitor: CliCollaborationMonitor | None = None,
+    output: Callable[[str], None] | None = None,
 ) -> bool:
     global current_directory, auto_approve_commands, allow_python_run, debug_mode
+    emit = output or (lambda text: print(text))
     parts = command.strip().split(maxsplit=1)
     name = parts[0].lower()
     argument = parts[1].strip() if len(parts) > 1 else ""
     if name == "/help":
-        print_help()
+        print_help(emit)
     elif name == "/clear":
         messages[:] = messages[:1]
-        print("대화 기록을 초기화했습니다.")
+        emit("대화 기록을 초기화했습니다.")
     elif name == "/cwd":
-        print(current_directory)
+        emit(str(current_directory))
     elif name == "/cd":
         if not argument:
-            print(f"현재 디렉터리: {current_directory}")
+            emit(f"현재 디렉터리: {current_directory}")
         else:
             target = Path(argument.strip('"'))
             if not target.is_absolute():
@@ -2733,90 +2735,90 @@ def handle_cli_command(
             try:
                 resolved = target.resolve()
                 if not resolved.is_dir():
-                    print(f"디렉터리를 찾을 수 없습니다: {resolved}")
+                    emit(f"디렉터리를 찾을 수 없습니다: {resolved}")
                 else:
                     current_directory = resolved
-                    print(f"현재 디렉터리: {current_directory}")
+                    emit(f"현재 디렉터리: {current_directory}")
             except OSError as error:
-                print(f"디렉터리 변경 실패: {error}")
+                emit(f"디렉터리 변경 실패: {error}")
     elif name == "/approve" and argument in {"on", "off"}:
         auto_approve_commands = argument == "on"
-        print(f"명령어 자동 승인: {'켜짐' if auto_approve_commands else '꺼짐'}")
+        emit(f"명령어 자동 승인: {'켜짐' if auto_approve_commands else '꺼짐'}")
     elif name == "/python-run" and argument in {"on", "off"}:
         allow_python_run = argument == "on"
-        print(f"Python 파일 실행: {'허용' if allow_python_run else '비활성화'}")
+        emit(f"Python 파일 실행: {'허용' if allow_python_run else '비활성화'}")
     elif name == "/debug":
         if argument not in {"", "on", "off"}:
-            print("사용법: /debug [on|off]")
+            emit("사용법: /debug [on|off]")
         else:
             if argument:
                 debug_mode = argument == "on"
-            print(f"디버그 모드: {'켜짐' if debug_mode else '꺼짐'}")
+            emit(f"디버그 모드: {'켜짐' if debug_mode else '꺼짐'}")
     elif name == "/rag-index":
-        print(rag_index_documents(argument or "."))
+        emit(rag_index_documents(argument or "."))
     elif name == "/rag-search":
         if not argument:
-            print("사용법: /rag-search <질문>")
+            emit("사용법: /rag-search <질문>")
         else:
-            print(rag_search(argument))
+            emit(rag_search(argument))
     elif name == "/gmail":
-        print(gmail_open())
+        emit(gmail_open())
     elif name == "/vscode":
         if live_analysis_server is None:
-            print("VS Code 실시간 분석 서버가 실행 중이 아닙니다.")
+            emit("VS Code 실시간 분석 서버가 실행 중이 아닙니다.")
         else:
-            print(
+            emit(
                 f"Endpoint: {live_analysis_server.endpoint}\n"
                 f"Token: {live_analysis_server.token}"
             )
             document = live_analysis_server.latest_document()
             if document:
                 age_seconds = max(0, int(time.time() - document["updated_at"]))
-                print(
+                emit(
                     f"마지막 수신 파일: {document['path']}\n"
                     f"마지막 동기화: {age_seconds}초 전 "
                     "(수정 적용 전 VS Code가 현재 버퍼와 일치하는지 확인합니다.)"
                 )
             else:
-                print("아직 VS Code에서 편집 내용을 받지 못했습니다.")
+                emit("아직 VS Code에서 편집 내용을 받지 못했습니다.")
     elif name == "/collab":
         if collaboration_monitor is None:
-            print("공동작업 모니터를 사용할 수 없습니다.")
+            emit("공동작업 모니터를 사용할 수 없습니다.")
         elif argument.startswith("office"):
             _, _, office_argument = argument.partition(" ")
             action, _, value = office_argument.partition(" ")
             value = value.strip()
             if action == "add" and value:
-                print(collaboration_monitor.add_office_document(value.strip('"')))
+                emit(collaboration_monitor.add_office_document(value.strip('"')))
             elif action in {"remove", "unwatch"} and value:
-                print(collaboration_monitor.remove_office_document(value.strip('"')))
+                emit(collaboration_monitor.remove_office_document(value.strip('"')))
             elif action == "list":
                 office_paths = collaboration_monitor.list_office_documents()
                 if office_paths:
-                    print("Office 감시 목록:")
+                    emit("Office 감시 목록:")
                     for office_path in office_paths:
-                        print(f"  {office_path}")
+                        emit(f"  {office_path}")
                 else:
-                    print("등록된 Office 감시 파일이 없습니다.")
+                    emit("등록된 Office 감시 파일이 없습니다.")
             elif action in {"approve", "reject"} and value.isdigit():
                 proposal_id = int(value)
                 if action == "approve":
-                    print(collaboration_monitor.approve_office_proposal(proposal_id))
+                    emit(collaboration_monitor.approve_office_proposal(proposal_id))
                 else:
-                    print(collaboration_monitor.reject_office_proposal(proposal_id))
+                    emit(collaboration_monitor.reject_office_proposal(proposal_id))
             else:
-                print(
+                emit(
                     "사용법: /collab office add <.docx|.pptx 파일> | list | "
                     "remove <파일> | approve <ID> | reject <ID>"
                 )
         elif argument not in {"on", "off"}:
-            print("사용법: /collab on|off 또는 /collab office ...")
+            emit("사용법: /collab on|off 또는 /collab office ...")
         else:
             enabled = argument == "on"
             collaboration_monitor.set_enabled(enabled)
         
             if enabled:
-                print(
+                emit(
                     f"공동작업 모드가 켜졌습니다. VS Code의 현재 편집 내용을 "
                     f"{collaboration_monitor.poll_interval}초마다 확인하고, "
                     f"{collaboration_monitor.stable_seconds}초간 변경이 없을 때 잠재적 오류를 검토합니다. "
@@ -2825,14 +2827,14 @@ def handle_cli_command(
                     f"수정은 승인 후에만 적용합니다 (Office 파일 {len(collaboration_monitor.list_office_documents())}개)."
                 )
             else:
-                print("공동작업 모드가 꺼졌습니다.")
+                emit("공동작업 모드가 꺼졌습니다.")
     elif name == "/jobs":
         if not scheduled_jobs:
-            print("예약된 명령어가 없습니다.")
+            emit("예약된 명령어가 없습니다.")
         for job in scheduled_jobs:
-            print(f"{job['target']} | {job['status']} | {job['command']}")
+            emit(f"{job['target']} | {job['status']} | {job['command']}")
     else:
-        print("알 수 없는 CLI 명령입니다. /help로 사용법을 확인하세요.")
+        emit("알 수 없는 CLI 명령입니다. /help로 사용법을 확인하세요.")
     return True
 
 

@@ -1,11 +1,74 @@
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import Quasar
 
 
 class OfficeMonitorGuiTests(unittest.TestCase):
+    def test_cli_handler_returns_help_to_gui_output_callback(self) -> None:
+        output: list[str] = []
+
+        Quasar.agent.handle_cli_command(
+            "/help",
+            [{"role": "system", "content": "system prompt"}],
+            output=output.append,
+        )
+
+        self.assertEqual(len(output), 1)
+        self.assertIn("/collab on|off", output[0])
+
+    def test_chat_command_captures_cli_output(self) -> None:
+        messages = [{"role": "system", "content": "system prompt"}]
+        app = SimpleNamespace(messages=messages)
+
+        with patch.object(
+            Quasar.agent,
+            "handle_cli_command",
+            side_effect=lambda command, _messages, output, **_kwargs: output(
+                f"handled {command}"
+            ),
+        ) as handle_command:
+            result = Quasar.QuasarDesktopApp._run_chat_command(
+                app,
+                "/help",
+            )
+
+        self.assertEqual(result, "handled /help")
+        handle_command.assert_called_once_with(
+            "/help",
+            messages,
+            collaboration_monitor=None,
+            output=ANY,
+        )
+
+    def test_collaboration_command_uses_gui_office_monitor(self) -> None:
+        monitor = Mock()
+        app = SimpleNamespace(
+            messages=[],
+            _ensure_office_monitor=Mock(return_value=monitor),
+        )
+        with patch.object(
+            Quasar.agent,
+            "handle_cli_command",
+            side_effect=lambda _command, _messages, output, **_kwargs: output(
+                "감시 시작"
+            ),
+        ) as handle_command:
+            result = Quasar.QuasarDesktopApp._run_chat_command(
+                app,
+                "/collab on",
+            )
+
+        self.assertEqual(result, "감시 시작")
+        app._ensure_office_monitor.assert_called_once_with()
+        handle_command.assert_called_once_with(
+            "/collab on",
+            [],
+            collaboration_monitor=monitor,
+            output=ANY,
+        )
+
     def test_enable_failure_unchecks_control(self) -> None:
         checkbox = Mock()
         checkbox.blockSignals.side_effect = [False, True]

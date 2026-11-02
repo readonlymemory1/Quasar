@@ -1599,7 +1599,7 @@ class QuasarDesktopApp(QMainWindow):
         composer_layout = QHBoxLayout(composer_panel)
         composer_layout.setContentsMargins(10, 6, 8, 6)
         self.composer = MessageInput()
-        self.composer.setPlaceholderText("무엇을 도와드릴까요?")
+        self.composer.setPlaceholderText("메시지 또는 / 명령어를 입력하세요")
         self.composer.setFixedHeight(58)
         self.composer.send_requested.connect(self.submit)
         composer_layout.addWidget(self.composer, 1)
@@ -1632,7 +1632,9 @@ class QuasarDesktopApp(QMainWindow):
         self.voice_response_toggle.toggled.connect(self._set_tts_enabled)
         hint_row.addWidget(self.voice_response_toggle)
         hint_row.addStretch(1)
-        self.composer_hint = QLabel("Space 길게 누르기: 말하기  ·  Enter: 전송")
+        self.composer_hint = QLabel(
+            "Space 길게 누르기: 말하기  ·  Enter: 전송  ·  /help: 명령어 목록"
+        )
         self.composer_hint.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.composer_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px; padding-right: 4px;")
         hint_row.addWidget(self.composer_hint)
@@ -2139,6 +2141,44 @@ class QuasarDesktopApp(QMainWindow):
         approve_button.clicked.connect(lambda: finish_proposal(True))
         reject_button.clicked.connect(lambda: finish_proposal(False))
 
+    def _clear_chat_view(self) -> None:
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            child_layout = item.layout()
+            if child_layout is not None:
+                while child_layout.count():
+                    child = child_layout.takeAt(0)
+                    if child.widget() is not None:
+                        child.widget().deleteLater()
+                child_layout.deleteLater()
+            elif item.widget() is not None:
+                item.widget().deleteLater()
+
+    def _run_chat_command(self, command: str) -> str:
+        monitor = None
+        command_name = command.strip().split(maxsplit=1)[0].lower()
+        if command_name == "/collab":
+            try:
+                monitor = self._ensure_office_monitor()
+            except Exception as error:
+                return f"명령 실행 실패: {type(error).__name__}: {error}"
+
+        output: list[str] = []
+        try:
+            agent.handle_cli_command(
+                command,
+                self.messages,
+                collaboration_monitor=monitor,
+                output=output.append,
+            )
+        except Exception as error:
+            return f"명령 실행 실패: {type(error).__name__}: {error}"
+
+        result = "\n".join(output).strip()
+        if command.strip().lower() == "/clear":
+            self._clear_chat_view()
+        return result or "명령을 실행했습니다."
+
     def _configure_agent(self) -> None:
         agent.current_directory = Path(__file__).resolve().parent
         agent.auto_approve_commands = True
@@ -2174,6 +2214,12 @@ class QuasarDesktopApp(QMainWindow):
             self.model = selected_model
         prompt = self.composer.toPlainText().strip()
         if not prompt:
+            return
+        if prompt.startswith("/"):
+            self.composer.clear()
+            self._add_message("user", prompt)
+            result = self._run_chat_command(prompt)
+            self._add_message("assistant", result)
             return
         if self.client is None:
             self._add_message(
