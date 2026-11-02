@@ -1,6 +1,6 @@
 import io
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import quasar_cli
 
@@ -62,6 +62,7 @@ class WebSearchTests(unittest.TestCase):
             patch.object(quasar_cli, "browser_ai_window_handles", []),
             patch.object(quasar_cli, "browser_tab_ids", {}),
             patch.object(quasar_cli, "browser_tab_owners", {}),
+            patch.object(quasar_cli, "browser_next_tab_id", 1),
             patch.object(quasar_cli, "browser_active_window_handle", None),
         ):
             result = quasar_cli.run_tool("web_open_new_tab", {"url": "https://www.google.com/"})
@@ -109,6 +110,89 @@ class WebSearchTests(unittest.TestCase):
 
         self.assertIs(result, page)
         page.switch_to.window.assert_called_once_with("user-tab")
+
+    def test_browser_starts_with_only_one_tab(self) -> None:
+        page = Mock()
+        page.window_handles = ["user-tab"]
+        chrome_process = Mock()
+        chrome_process.poll.return_value = None
+        startup_info = Mock(dwFlags=0)
+        with (
+            patch.object(quasar_cli, "browser", None),
+            patch.object(quasar_cli, "chrome_process", None),
+            patch.object(quasar_cli, "browser_user_window_handle", None),
+            patch.object(quasar_cli, "browser_active_window_handle", None),
+            patch.object(quasar_cli, "browser_ai_window_handles", []),
+            patch.object(quasar_cli, "browser_tab_ids", {}),
+            patch.object(quasar_cli, "browser_tab_owners", {}),
+            patch.object(quasar_cli, "browser_next_tab_id", 1),
+            patch.object(quasar_cli.Path, "is_file", return_value=True),
+            patch.object(quasar_cli.Path, "mkdir"),
+            patch.object(
+                quasar_cli.subprocess,
+                "STARTUPINFO",
+                return_value=startup_info,
+            ),
+            patch.object(quasar_cli.subprocess, "Popen", return_value=chrome_process),
+            patch.object(
+                quasar_cli.urllib.request,
+                "urlopen",
+                return_value=MagicMock(),
+            ),
+            patch.object(quasar_cli.webdriver, "ChromeOptions", return_value=Mock()),
+            patch.object(quasar_cli.webdriver, "Chrome", return_value=page),
+            patch.object(quasar_cli, "ChromeDriverManager") as driver_manager,
+            patch.object(quasar_cli, "Service"),
+        ):
+            driver_manager.return_value.install.return_value = "chromedriver"
+            result = quasar_cli.get_browser()
+
+            self.assertIs(result, page)
+            self.assertEqual(quasar_cli.browser_user_window_handle, "user-tab")
+            self.assertEqual(quasar_cli.browser_active_window_handle, "user-tab")
+            self.assertEqual(quasar_cli.browser_tab_owners, {"user-tab": "user"})
+            self.assertEqual(quasar_cli.browser_ai_window_handles, [])
+
+        page.switch_to.new_window.assert_not_called()
+
+    def test_browser_does_not_reopen_a_tab_when_the_active_tab_was_closed(self) -> None:
+        page = Mock()
+        page.window_handles = ["remaining-tab"]
+        with (
+            patch.object(quasar_cli, "browser", page),
+            patch.object(quasar_cli, "browser_user_window_handle", "closed-user-tab"),
+            patch.object(quasar_cli, "browser_active_window_handle", "closed-ai-tab"),
+            patch.object(quasar_cli, "browser_ai_window_handles", ["closed-ai-tab"]),
+            patch.object(
+                quasar_cli,
+                "browser_tab_ids",
+                {"closed-user-tab": "tab-1", "closed-ai-tab": "tab-2"},
+            ),
+            patch.object(
+                quasar_cli,
+                "browser_tab_owners",
+                {"closed-user-tab": "user", "closed-ai-tab": "ai"},
+            ),
+        ):
+            result = quasar_cli.get_browser()
+
+            self.assertIs(result, page)
+            self.assertEqual(quasar_cli.browser_active_window_handle, "remaining-tab")
+            self.assertIsNone(quasar_cli.browser_user_window_handle)
+            self.assertNotIn("closed-ai-tab", quasar_cli.browser_tab_ids)
+            self.assertEqual(quasar_cli.browser_ai_window_handles, [])
+
+        page.switch_to.new_window.assert_not_called()
+        page.switch_to.window.assert_called_once_with("remaining-tab")
+
+    def test_browser_does_not_create_a_tab_when_all_tabs_are_closed(self) -> None:
+        page = Mock()
+        page.window_handles = []
+        with patch.object(quasar_cli, "browser", page):
+            with self.assertRaisesRegex(RuntimeError, "no open tabs"):
+                quasar_cli.get_browser()
+
+        page.switch_to.new_window.assert_not_called()
 
     def test_switch_tab_allows_selected_user_and_ai_tabs(self) -> None:
         page = Mock()

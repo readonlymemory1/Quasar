@@ -32,7 +32,10 @@ class VoiceWorkerTests(unittest.TestCase):
                 return False
 
         sounddevice = types.ModuleType("sounddevice")
-        sounddevice.query_devices = lambda **_kwargs: {"default_samplerate": 44_100}
+        sounddevice.query_devices = lambda **_kwargs: {
+            "default_samplerate": 44_100,
+            "max_input_channels": 1,
+        }
         sounddevice.RawInputStream = FakeInputStream
 
         class FakeRecognizer:
@@ -55,6 +58,111 @@ class VoiceWorkerTests(unittest.TestCase):
         self.assertEqual(captured[0].shape, (16_000,))
         self.assertTrue(0.11 < float(np.max(captured[0])) < 0.13)
         self.assertEqual(errors, [])
+
+    def test_capture_uses_selected_input_device(self) -> None:
+        errors: list[str] = []
+        signals = Quasar.AppSignals()
+        signals.voice_failed.connect(errors.append)
+        calls: dict[str, object] = {}
+
+        class FakeInputStream:
+            def __init__(self, **kwargs: object) -> None:
+                calls["stream_device"] = kwargs["device"]
+                self.callback = kwargs["callback"]
+
+            def __enter__(self) -> "FakeInputStream":
+                audio = np.full(16_000, 1_000, dtype=np.int16).tobytes()
+                self.callback(audio, 16_000, None, None)
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+        sounddevice = types.ModuleType("sounddevice")
+
+        def query_devices(
+            device: int | None = None,
+            *,
+            kind: str | None = None,
+        ) -> dict[str, int]:
+            calls["query_device"] = device
+            calls["query_kind"] = kind
+            return {
+                "default_samplerate": 16_000,
+                "max_input_channels": 1,
+            }
+
+        sounddevice.query_devices = query_devices
+        sounddevice.RawInputStream = FakeInputStream
+
+        class FakeRecognizer:
+            def transcribe(self, _audio: np.ndarray, _signals: object) -> None:
+                return None
+
+        stop_event = threading.Event()
+        stop_event.set()
+        worker = Quasar.VoiceCaptureWorker(
+            stop_event,
+            FakeRecognizer(),
+            signals,
+            device_index=2,
+        )
+
+        with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            worker.run()
+
+        self.assertEqual(calls["query_device"], 2)
+        self.assertIsNone(calls["query_kind"])
+        self.assertEqual(calls["stream_device"], 2)
+        self.assertEqual(errors, [])
+
+    def test_selected_device_must_have_input_channels(self) -> None:
+        errors: list[str] = []
+        signals = Quasar.AppSignals()
+        signals.voice_failed.connect(errors.append)
+        sounddevice = types.ModuleType("sounddevice")
+        sounddevice.query_devices = lambda *_args, **_kwargs: {
+            "default_samplerate": 48_000,
+            "max_input_channels": 0,
+        }
+
+        class FakeRecognizer:
+            def transcribe(self, _audio: np.ndarray, _signals: object) -> None:
+                raise AssertionError("Output-only device must not be used")
+
+        stop_event = threading.Event()
+        worker = Quasar.VoiceCaptureWorker(
+            stop_event,
+            FakeRecognizer(),
+            signals,
+            device_index=8,
+        )
+
+        with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            worker.run()
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("마이크 입력을 지원하지 않습니다", errors[0])
+
+    def test_saved_microphone_is_resolved_after_device_reordering(self) -> None:
+        devices = [
+            {"name": "Speakers", "hostapi": 0, "max_input_channels": 0},
+            {"name": "Preferred microphone", "hostapi": 1, "max_input_channels": 1},
+            {"name": "Preferred microphone", "hostapi": 1, "max_input_channels": 2},
+        ]
+
+        self.assertEqual(
+            Quasar.find_input_device_index(
+                devices,
+                "Preferred microphone",
+                1,
+                2,
+            ),
+            2,
+        )
+        self.assertIsNone(
+            Quasar.find_input_device_index(devices, "Speakers", 0)
+        )
 
     def test_default_nemotron_model_transcribes_korean(self) -> None:
         recognized: list[str] = []

@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 
 from dotenv import load_dotenv
@@ -1209,18 +1209,11 @@ def get_browser():
             raise RuntimeError("Quasar Chrome started without an available tab.")
         browser_user_window_handle = handles[0]
         _register_browser_tab(browser_user_window_handle, "user")
-        browser.switch_to.new_window("tab")
-        browser_active_window_handle = browser.current_window_handle
-        _register_browser_tab(browser_active_window_handle, "ai")
+        browser_active_window_handle = browser_user_window_handle
     else:
         _sync_browser_tabs(browser)
         if browser_active_window_handle not in browser.window_handles:
-            if not browser_ai_window_handles:
-                browser.switch_to.new_window("tab")
-                browser_active_window_handle = browser.current_window_handle
-                _register_browser_tab(browser_active_window_handle, "ai")
-            else:
-                browser_active_window_handle = browser_ai_window_handles[-1]
+            browser_active_window_handle = browser.window_handles[0]
         browser.switch_to.window(browser_active_window_handle)
     return browser
 
@@ -1249,6 +1242,7 @@ def _register_browser_tab(window_handle: str, owner: str) -> str:
 
 
 def _sync_browser_tabs(page) -> None:
+    global browser_user_window_handle
     handles = page.window_handles
     if not handles:
         raise RuntimeError("Quasar Chrome has no open tabs.")
@@ -1259,6 +1253,8 @@ def _sync_browser_tabs(page) -> None:
             browser_tab_owners.pop(window_handle, None)
             if window_handle in browser_ai_window_handles:
                 browser_ai_window_handles.remove(window_handle)
+    if browser_user_window_handle not in open_handles:
+        browser_user_window_handle = None
     for window_handle in handles:
         if window_handle not in browser_tab_ids:
             _register_browser_tab(window_handle, "user")
@@ -2231,16 +2227,19 @@ def run_tool(
     return f"알 수 없는 도구: {name}"
 
 
-def print_tool_status(name: str, mcp_manager: MCPServerManager | None) -> None:
+def _tool_status_label(name: str, mcp_manager: MCPServerManager | None) -> str:
     if name == "message_to_user":
-        label = "사용자 메시지 전송"
-    elif name == "discover_mcp_tools":
-        label = "Searching MCP tools"
-    elif mcp_manager is not None and name in mcp_manager.tools:
+        return "사용자 메시지 전송"
+    if name == "discover_mcp_tools":
+        return "Searching MCP tools"
+    if mcp_manager is not None and name in mcp_manager.tools:
         connection, original_name, _ = mcp_manager.tools[name]
-        label = f"{connection.name}.{original_name}"
-    else:
-        label = name
+        return f"{connection.name}.{original_name}"
+    return name
+
+
+def print_tool_status(name: str, mcp_manager: MCPServerManager | None) -> None:
+    label = _tool_status_label(name, mcp_manager)
     print(f"Using tool: {label}", flush=True)
 
 
@@ -2423,6 +2422,7 @@ def request_agent(
     user_input: str,
     live_analysis_server: CliLiveAnalysisServer | None = None,
     mcp_manager: MCPServerManager | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> str:
     saved_user_message: dict[str, Any] = {"role": "user", "content": user_input}
     working_user_message = saved_user_message
@@ -2479,6 +2479,7 @@ def request_agent(
             screen_request,
             live_analysis_server,
             mcp_manager,
+            progress_callback,
         )
 
     active_mcp_names: set[str] = set()
@@ -2495,6 +2496,8 @@ def request_agent(
                 if schema["function"]["name"] in active_mcp_names
             )
         print("\nThinking...", flush=True)
+        if progress_callback is not None:
+            progress_callback("요청을 분석하고 있습니다...")
         response = client.chat.completions.create(
             model=model,
             messages=working_messages,
@@ -2514,6 +2517,14 @@ def request_agent(
         screenshot_result = None
         for tool_call in response_message.tool_calls:
             print_tool_status(tool_call.function.name, mcp_manager)
+            tool_label = _tool_status_label(tool_call.function.name, mcp_manager)
+            if progress_callback is not None:
+                progress_label = (
+                    "MCP 도구 검색"
+                    if tool_call.function.name == "discover_mcp_tools"
+                    else tool_label
+                )
+                progress_callback(f"도구 실행 중: {progress_label}")
             try:
                 arguments = json.loads(tool_call.function.arguments or "{}")
                 if not isinstance(arguments, dict):
@@ -2527,6 +2538,8 @@ def request_agent(
                         saved_user_message,
                         {"role": "assistant", "content": final_response.strip()},
                     ])
+                    if progress_callback is not None:
+                        progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
                 if tool_call.function.name == "discover_mcp_tools":
                     if mcp_manager is None:
@@ -2559,6 +2572,8 @@ def request_agent(
                 image_data, width, height = result
                 result = f"현재 화면을 {width} x {height} 픽셀로 캡처했습니다."
             _debug_tool_result(tool_call.function.name, result)
+            if progress_callback is not None:
+                progress_callback(f"도구 완료: {progress_label}")
             working_messages.append({
                 "tool_call_id": tool_call.id,
                 "role": "tool",
@@ -2577,6 +2592,8 @@ def request_agent(
             })
 
     print("\nThinking...", flush=True)
+    if progress_callback is not None:
+        progress_callback("요청을 분석하고 있습니다...")
     response = client.chat.completions.create(model=model, messages=working_messages)
     answer = response.choices[0].message.content or "도구 실행 횟수 제한에 도달했습니다. 요청을 나누어 다시 시도해 주세요."
     print_debug_event("도구 반복 한도 후 모델 응답", answer)
@@ -2593,6 +2610,7 @@ def request_agent_with_responses(
     screen_request: bool,
     live_analysis_server: CliLiveAnalysisServer | None = None,
     mcp_manager: MCPServerManager | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> str:
     response_input = to_responses_input(working_messages)
     active_mcp_names: set[str] = set()
@@ -2609,6 +2627,8 @@ def request_agent_with_responses(
                 if schema["function"]["name"] in active_mcp_names
             )
         print("\nThinking...", flush=True)
+        if progress_callback is not None:
+            progress_callback("요청을 분석하고 있습니다...")
         response = client.responses.create(
             model=model,
             input=response_input,
@@ -2634,6 +2654,14 @@ def request_agent_with_responses(
         screenshot_result = None
         for tool_call in function_calls:
             print_tool_status(tool_call.name, mcp_manager)
+            tool_label = _tool_status_label(tool_call.name, mcp_manager)
+            if progress_callback is not None:
+                progress_label = (
+                    "MCP 도구 검색"
+                    if tool_call.name == "discover_mcp_tools"
+                    else tool_label
+                )
+                progress_callback(f"도구 실행 중: {progress_label}")
             try:
                 arguments = json.loads(tool_call.arguments or "{}")
                 if not isinstance(arguments, dict):
@@ -2647,6 +2675,8 @@ def request_agent_with_responses(
                         saved_user_message,
                         {"role": "assistant", "content": final_response.strip()},
                     ])
+                    if progress_callback is not None:
+                        progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
                 if tool_call.name == "discover_mcp_tools":
                     if mcp_manager is None:
@@ -2680,6 +2710,8 @@ def request_agent_with_responses(
                 image_data, width, height = result
                 result = f"현재 화면을 {width} x {height} 픽셀로 캡처했습니다."
             _debug_tool_result(tool_call.name, result)
+            if progress_callback is not None:
+                progress_callback(f"도구 완료: {progress_label}")
             response_input.append({
                 "type": "function_call_output",
                 "call_id": tool_call.call_id,
@@ -2704,6 +2736,8 @@ def request_agent_with_responses(
             })
 
     print("\nThinking...", flush=True)
+    if progress_callback is not None:
+        progress_callback("요청을 분석하고 있습니다...")
     response = client.responses.create(model=model, input=response_input)
     answer = response.output_text or "도구 실행 횟수 제한에 도달했습니다. 요청을 나누어 다시 시도해 주세요."
     print_debug_event("도구 반복 한도 후 모델 응답", answer)
@@ -2800,54 +2834,56 @@ def main(argv: list[str] | None = None) -> None:
     #     "for todo requests and confirm their result before reporting a change."
     # )
     tool_descriptions = (
-        "- todo_list: 할 일 목록 조회\n"
-        "- todo_add: 할 일 추가\n"
-        "- todo_update: 할 일 수정 또는 완료 상태 변경\n"
-        "- todo_delete: 할 일 삭제\n"
-        "- execute_cmd: 작업 폴더에서 시스템 명령 실행\n"
-        "- rag_index_documents: 문서를 검색용으로 색인\n"
-        "- rag_search: 색인된 문서 검색\n"
-        "- web_search: 공개 웹 검색\n"
-        "- web_navigate: Chrome에서 URL 열기\n"
-        "- web_click: 현재 페이지의 요소 클릭\n"
-        "- web_input: 현재 페이지 입력란에 텍스트 입력\n"
-        "- web_scroll: 현재 페이지 스크롤\n"
-        "- web_back: Chrome에서 이전 페이지로 이동\n"
-        "- web_key_press: 현재 포커스된 요소에 키 입력\n"
-        "- gmail_open: Gmail 받은편지함 열기\n"
-        "- gmail_search: Gmail 메일 검색\n"
-        "- gmail_create_draft: Gmail 초안 작성\n"
-        "- gmail_send: Gmail 메일 발송\n"
-        "- get_current_time: 현재 날짜와 시간 조회\n"
-        "- create_calendar_event: 캘린더 이벤트 파일 생성 및 열기\n"
-        "- schedule_command: 지정한 시각에 명령 예약\n"
-        "- set_timer: 타이머 설정\n"
-        "- set_alarm: 알람 설정\n"
-        "- capture_screen: 현재 화면 캡처\n"
-        "- vscode_open: VS Code에서 파일 또는 폴더 열기\n"
-        "- python_list_files: 작업 폴더의 Python 파일 목록 조회\n"
-        "- python_read_file: Python 파일 읽기\n"
-        "- read_workspace_file: 작업 폴더의 텍스트 파일 읽기\n"
-        "- write_workspace_file: 작업 폴더의 텍스트 파일 생성 또는 수정\n"
-        "- python_check_syntax: Python 파일 문법 검사\n"
-        "- python_run_file: Python 파일 실행\n"
-        "- discover_mcp_tools: 연결된 MCP 도구 검색\n"
-        "- message_to_user: 작업 중 진행 상황 또는 오류 메시지 전달\n"
-        "- end: 현재 요청을 마치고 최종 응답 반환\n"
-        "- MCP 도구: 검색 결과로 제공된 외부 연동 도구 실행"
+        "- todo_list: list to-do items\n"
+        "- todo_add: add a to-do item\n"
+        "- todo_update: edit a to-do item or change its completion status\n"
+        "- todo_delete: delete a to-do item\n"
+        "- execute_cmd: run a system command in the working directory\n"
+        "- rag_index_documents: index documents for search\n"
+        "- rag_search: search indexed documents\n"
+        "- web_search: search the public web\n"
+        "- web_navigate: open a URL in Chrome\n"
+        "- web_click: click an element on the current page\n"
+        "- web_input: enter text into a field on the current page\n"
+        "- web_scroll: scroll the current page\n"
+        "- web_back: navigate back in Chrome\n"
+        "- web_key_press: press a key on the currently focused element\n"
+        "- gmail_open: open the Gmail inbox\n"
+        "- gmail_search: search Gmail messages\n"
+        "- gmail_create_draft: create a Gmail draft\n"
+        "- gmail_send: send a Gmail message\n"
+        "- get_current_time: get the current date and time\n"
+        "- create_calendar_event: create and open a calendar event file\n"
+        "- schedule_command: schedule a command for a specified time\n"
+        "- set_timer: set a timer\n"
+        "- set_alarm: set an alarm\n"
+        "- capture_screen: capture the current screen\n"
+        "- vscode_open: open a file or folder in VS Code\n"
+        "- python_list_files: list Python files in the working directory\n"
+        "- python_read_file: read a Python file\n"
+        "- read_workspace_file: read a text file in the working directory\n"
+        "- write_workspace_file: create or edit a text file in the working directory\n"
+        "- python_check_syntax: check the syntax of a Python file\n"
+        "- python_run_file: run a Python file\n"
+        "- discover_mcp_tools: discover connected MCP tools\n"
+        "- message_to_user: send a progress update or error message to the user\n"
+        "- end: finish the current request and return the final response\n"
+        "- MCP tools: run external integrations discovered through search"
     )
     system_prompt = (
         "You are Quasar, a business-automation CLI agent. Understand requests and answer clearly in Korean. Use tools when "
         "useful; answer greetings directly. Never expose tool JSON, schemas, or internal routing. Run Python only when enabled.\n\n"
-        "작업을 시작할 때 요청별 최종 목표를 정하고, 목표를 달성할 수 있는 작고 구체적인 하위 목표로 나누어 순서대로 진행하세요. "
-        "여러 단계 작업은 목표와 하위 목표를 사용자에게 간결하게 먼저 알리고 각 단계의 결과를 확인하세요. "
-        "간단한 단일 작업이나 질문에는 불필요한 계획을 출력하지 말고 바로 처리하세요.\n\n"
-        "작업 중간에 사용자에게 진행 상황이나 오류를 알려야 할 때는 일반 텍스트를 출력하지 말고 message_to_user 도구를 호출하세요. "
-        "긴 작업은 중요한 단계 전후에 간결한 진행 메시지를 보내고, 도구 실패 시 원인과 복구 시도 내용을 오류 메시지로 알리세요. "
-        "도구 실행 결과가 실패를 나타내면 즉시 포기하지 말고, 가능한 진단 도구를 활용해 원인을 파악한 뒤 안전한 수정 방법을 찾아 적용하고 결과를 검증하세요. "
-        "같은 도구를 같은 인자와 방법으로 무의미하게 반복하지 말고, 새 정보에 따라 접근을 바꾸세요. "
-        "데이터 삭제, 외부 발송 등 되돌리기 어렵거나 영향이 큰 조치를 재시도하기 전에 필요한 사용자 확인을 받으세요. "
-        "도구 반복 한도 안에서 복구를 시도하고, 더 진행할 방법이 없거나 안전하지 않으면 실패 원인과 미완료 사항을 분명히 보고하세요.\n\n"
+        "At the start of each request, identify its final goal and break it into small, concrete subgoals that can be completed in sequence. "
+        "For multi-step tasks, briefly explain the goal and subgoals to the user first, then verify the result of each step. "
+        "For simple, single-step tasks or questions, respond directly without unnecessary planning.\n\n"
+        "When you need to report progress or an error during a task, call message_to_user instead of outputting ordinary text. "
+        "For long tasks, send concise progress updates before and after important steps; when a tool fails, report the cause and recovery attempts. "
+        "If a tool result indicates failure, do not give up immediately: use available diagnostic tools to identify the cause, apply a safe fix, and verify the result. "
+        "Do not repeat the same tool call with the same arguments and approach without a reason; adapt based on new information. "
+        "After using a tool, forget its usage instructions. Before making another tool call, re-check the current request and the available tool definitions. "
+        "This does not mean forgetting or ignoring system safety rules or user-approval requirements. "
+        "Before retrying a consequential or difficult-to-reverse action, such as deleting data or sending something externally, obtain any necessary user confirmation. "
+        "Attempt recovery within the tool-call limit. If no further safe or useful action is possible, clearly report the failure cause and what remains incomplete.\n\n"
         "For workspace documents, search with rag_search (index first with rag_index_documents if needed), cite source paths, "
         "and do not invent facts. Prefer the active VS Code file; do not summarize unrelated workspace content. "
         "For coding, pair program and ask only if ambiguity changes the implementation. Read files with read_workspace_file "
@@ -2856,15 +2892,15 @@ def main(argv: list[str] | None = None) -> None:
         "Use web_search for independent public-web searches; it must not open or change the controlled Chrome session. "
         "When asked to open a URL in a new tab, use web_open_new_tab and report its actual result. "
         "For other requests to open or go to a URL, use web_navigate directly and report its actual result; do not substitute a search result link "
-        "or claim a browser-control limitation without trying the tool. The controlled Chrome starts with the user's tab first "
-        "and a separate AI-owned tab second. Use web_list_tabs to inspect tab order, stable IDs, titles, URLs, and ownership. "
+        "or claim a browser-control limitation without trying the tool. The controlled Chrome starts with one tab; "
+        "create another tab only when the user requests one. Use web_list_tabs to inspect tab order, stable IDs, titles, URLs, and ownership. "
         "When the user specifies a tab by number, ID, or title, identify it with web_list_tabs if needed and use "
         "web_switch_tab before any browser action; keep using that selected tab until the user specifies another. "
-        "If no tab is specified, use the currently selected tab (the AI tab by default). Browser actions operate in the selected tab. "
+        "If no tab is specified, use the currently selected tab. Browser actions operate in the selected tab. "
         "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
         "Never promise a retry before making it or claim success without a confirming tool result. For web_input, inspect the returned "
         "result and do not claim text was entered or sent unless verified. "
-        "사용 가능한 도구:\n"
+        "Available tools:\n"
         f"{tool_descriptions}\n\n"
         "For every agent task, once the requested work is complete, stop all further work and immediately call end with the final result. "
         "If the task is blocked and no safe or useful action remains, immediately call end with the blocker and what was not completed. "

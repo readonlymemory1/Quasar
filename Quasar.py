@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import quasar_cli as agent
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from quasar_galaxy import (
     CANVAS_BACKGROUND_STOPS,
@@ -25,6 +25,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -46,19 +49,74 @@ MUTED = "#929bb8"
 ACCENT = "#9b91ff"
 
 SYSTEM_PROMPT = (
-    "당신은 Quasar입니다. 한국어로 간결하고 정확하게 답하세요. "
-    "필요하면 제공된 도구를 사용하되, 요청하지 않은 시스템 변경이나 외부 작업은 하지 마세요. "
-    "명령 실행은 사용자의 별도 승인을 받아야 합니다. 이메일은 사용자가 명시적으로 요청한 경우에만 발송하고, "
-    "요청이 모호하면 먼저 확인하세요. 도구 결과를 확인하기 전에는 성공했다고 말하지 마세요."
+    "You are Quasar. Respond concisely and accurately in Korean. "
+    "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
+    "Run routine commands needed for the user's request without asking for extra confirmation. "
+    "Wait for approval before destructive, privileged, publishing, or scheduled commands. "
+    "Send email only when explicitly requested, and clarify ambiguous requests first. "
+    "Do not claim success until you have verified the tool result."
 )
 
 NEMO_SPEECH_MODEL = "nemotron-3.5"
+
+DANGEROUS_COMMAND_PATTERNS = (
+    (
+        r"(?<![\w.-])(?:rm|rmdir|rd|del|erase|shred|sdelete|format|diskpart|wipe|truncate|remove-item|clear-content|set-content|out-file)\b",
+        "파일이나 디스크의 내용을 삭제하거나 덮어쓸 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:shutdown|stop-computer|restart-computer|reboot|halt|poweroff|logoff)\b",
+        "컴퓨터를 종료하거나 재시작할 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:sudo|doas|runas)\b|start-process\b[^;&|]*-verb\s+runas",
+        "관리자 권한으로 실행할 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:reg(?:\.exe)?\s+(?:add|delete)|sc(?:\.exe)?\s+(?:create|config|delete|stop)|net\s+(?:user|localgroup|stop)|netsh\s+advfirewall|bcdedit|takeown|icacls|set-acl|set-executionpolicy)\b",
+        "Windows 설정, 계정, 서비스 또는 권한을 변경할 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:chmod|chown|mount|umount)\b",
+        "시스템 파일 권한이나 디스크 연결 상태를 변경할 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])git\s+(?:reset\s+--hard|clean\b(?![^\r\n]*(?:--dry-run|(?:^|\s)-n(?:\s|$)))|push\b|branch\s+-D\b|restore\s+--worktree\b)",
+        "Git 변경사항을 삭제하거나 원격 저장소에 반영할 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:npm\s+publish|twine\s+upload|docker\s+push|terraform\s+destroy|kubectl\s+delete|gh\s+release\s+create)\b",
+        "패키지를 배포하거나 원격 인프라를 변경할 수 있습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:powershell|pwsh)\b[^;&|]*-(?:encodedcommand|enc)\b",
+        "인코딩된 스크립트는 내용을 미리 확인하기 어렵습니다.",
+    ),
+    (
+        r"(?<![\w.-])(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir)|Path\.(?:unlink|rmdir))\b",
+        "스크립트에서 파일이나 폴더를 삭제할 수 있습니다.",
+    ),
+    (
+        r"(?:curl|wget|invoke-webrequest|iwr)\b[^;&|]*(?:\||&&|;)[^;&|]*(?:iex|invoke-expression|(?:^|[\s])(?:bash|sh|python|pwsh|powershell)\b)",
+        "인터넷에서 받은 내용을 바로 실행할 수 있습니다.",
+    ),
+)
+
+
+def command_approval_reason(command: str, scheduled: bool = False) -> str | None:
+    if scheduled:
+        return "예약된 명령은 나중에 별도 확인 없이 실행됩니다."
+    for pattern, reason in DANGEROUS_COMMAND_PATTERNS:
+        if re.search(pattern, command, flags=re.IGNORECASE):
+            return reason
+    return None
 
 
 class AppSignals(QObject):
     response_ready = Signal(str)
     request_failed = Signal(str)
-    approval_requested = Signal(str, str, object)
+    request_progress = Signal(str)
+    approval_requested = Signal(str, str, str, object)
     models_loaded = Signal(str, object, object)
     voice_status = Signal(str)
     voice_text_ready = Signal(str)
@@ -100,6 +158,131 @@ class VoicePushButton(QPushButton):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+
+class MicrophoneSettingsDialog(QDialog):
+    def __init__(
+        self,
+        selected_device_index: int | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("설정")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.microphone_selector = QComboBox()
+        form.addRow("입력 마이크", self.microphone_selector)
+        layout.addLayout(form)
+
+        self.microphone_status = QLabel()
+        self.microphone_status.setWordWrap(True)
+        self.microphone_status.setStyleSheet(f"color: {MUTED};")
+        layout.addWidget(self.microphone_status)
+
+        self.refresh_microphones_button = QPushButton("마이크 목록 새로고침")
+        self.refresh_microphones_button.clicked.connect(
+            lambda: self.refresh_microphones()
+        )
+        layout.addWidget(self.refresh_microphones_button)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.refresh_microphones(selected_device_index)
+
+    @property
+    def selected_device_index(self) -> int | None:
+        device_index = self.microphone_selector.currentData()
+        if isinstance(device_index, int) and device_index >= 0:
+            return device_index
+        return None
+
+    @property
+    def selected_device_name(self) -> str:
+        return self.microphone_selector.currentText()
+
+    def refresh_microphones(self, preferred_device_index: int | None = None) -> None:
+        if preferred_device_index is None:
+            current_index = self.microphone_selector.currentData()
+            if isinstance(current_index, int) and current_index >= 0:
+                preferred_device_index = current_index
+
+        self.microphone_selector.clear()
+        self.microphone_selector.addItem("시스템 기본 마이크", -1)
+
+        try:
+            import sounddevice as sd
+        except ImportError as error:
+            self.microphone_selector.setEnabled(False)
+            self.microphone_status.setText(
+                f"마이크 기능을 사용할 수 없습니다: {error}"
+            )
+            return
+
+        try:
+            devices = sd.query_devices()
+        except sd.PortAudioError as error:
+            self.microphone_selector.setEnabled(False)
+            self.microphone_status.setText(
+                f"마이크 목록을 불러오지 못했습니다: {error}"
+            )
+            return
+
+        self.microphone_selector.setEnabled(True)
+        available_devices: list[int] = []
+        for device_index, device in enumerate(devices):
+            if int(device["max_input_channels"]) <= 0:
+                continue
+            self.microphone_selector.addItem(
+                f"{device['name']} (입력 {device_index})",
+                device_index,
+            )
+            available_devices.append(device_index)
+
+        if preferred_device_index in available_devices:
+            selected_index = self.microphone_selector.findData(preferred_device_index)
+            self.microphone_selector.setCurrentIndex(selected_index)
+            self.microphone_status.setText("사용할 마이크를 선택하세요.")
+        elif preferred_device_index is not None:
+            self.microphone_status.setText(
+                "저장된 마이크를 찾을 수 없어 시스템 기본 마이크를 선택했습니다."
+            )
+        elif available_devices:
+            self.microphone_status.setText("사용할 마이크를 선택하세요.")
+        else:
+            self.microphone_status.setText(
+                "사용 가능한 입력 마이크가 없습니다. 연결 후 목록을 새로고침하세요."
+            )
+
+
+def find_input_device_index(
+    devices: Any,
+    device_name: str,
+    host_api: int,
+    input_channels: int | None = None,
+) -> int | None:
+    fallback_index: int | None = None
+    for device_index, device in enumerate(devices):
+        if (
+            device["name"] == device_name
+            and int(device["hostapi"]) == host_api
+            and int(device["max_input_channels"]) > 0
+        ):
+            if (
+                input_channels is not None
+                and int(device["max_input_channels"]) == input_channels
+            ):
+                return device_index
+            if fallback_index is None:
+                fallback_index = device_index
+    return fallback_index
+
 
 class LocalSpeechRecognizer:
     def __init__(self) -> None:
@@ -254,18 +437,29 @@ class VoiceCaptureWorker(threading.Thread):
         stop_event: threading.Event,
         recognizer: LocalSpeechRecognizer,
         signals: AppSignals,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.stop_event = stop_event
         self.recognizer = recognizer
         self.signals = signals
+        self.device_index = device_index
 
     def run(self) -> None:
         try:
             import numpy as np
             import sounddevice as sd
 
-            input_device = sd.query_devices(kind="input")
+            input_device = (
+                sd.query_devices(kind="input")
+                if self.device_index is None
+                else sd.query_devices(self.device_index)
+            )
+            if int(input_device["max_input_channels"]) < 1:
+                raise RuntimeError(
+                    "선택한 장치는 마이크 입력을 지원하지 않습니다. "
+                    "설정에서 입력 마이크를 다시 선택해 주세요."
+                )
             sample_rate = int(input_device["default_samplerate"])
             if sample_rate <= 0:
                 raise RuntimeError("사용 가능한 마이크 샘플링 속도를 확인할 수 없습니다.")
@@ -288,6 +482,7 @@ class VoiceCaptureWorker(threading.Thread):
                 dtype="int16",
                 blocksize=1024,
                 callback=capture_audio,
+                device=self.device_index,
             ):
                 self.signals.voice_status.emit("듣는 중... 스페이스를 놓으면 전송합니다.")
                 while not self.stop_event.wait(0.1):
@@ -522,11 +717,12 @@ class QuasarDesktopApp(QMainWindow):
         self.messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
+        self.settings = QSettings("Quasar", "Quasar")
+        self.microphone_notice: str | None = None
+        self.microphone_device_index = self._restore_microphone_selection()
         self.busy = False
         self.closing = False
-        self.pending_response: str | None = None
-        self.response_body: QLabel | None = None
-        self.response_position = 0
+        self.activity_body: QLabel | None = None
         self.pending_approvals: list[dict[str, Any]] = []
         self.voice_recognizer = LocalSpeechRecognizer()
         self.voice_recording = False
@@ -537,6 +733,7 @@ class QuasarDesktopApp(QMainWindow):
         self.signals = AppSignals(self)
         self.signals.response_ready.connect(self._finish_with_response)
         self.signals.request_failed.connect(self._finish_with_error)
+        self.signals.request_progress.connect(self._show_request_progress)
         self.signals.approval_requested.connect(self._show_command_approval)
         self.signals.models_loaded.connect(self._apply_model_options)
         self.signals.voice_status.connect(self._show_voice_status)
@@ -614,6 +811,11 @@ class QuasarDesktopApp(QMainWindow):
         self.refresh_models_button.setMinimumHeight(40)
         self.refresh_models_button.clicked.connect(self._load_model_options)
         header.addWidget(self.refresh_models_button)
+
+        self.settings_button = QPushButton("설정")
+        self.settings_button.setMinimumHeight(40)
+        self.settings_button.clicked.connect(self._open_settings)
+        header.addWidget(self.settings_button)
         layout.addWidget(top_bar)
 
         self.status_label = QLabel()
@@ -747,9 +949,6 @@ class QuasarDesktopApp(QMainWindow):
             self.orb_column,
         )
         self.orb.clicked.connect(self.galaxy_transition.toggle)
-        self.response_timer = QTimer(self)
-        self.response_timer.setInterval(16)
-        self.response_timer.timeout.connect(self._stream_response_chunk)
         self.voice_button.setFocus()
 
     def resizeEvent(self, event: Any) -> None:
@@ -788,6 +987,158 @@ class QuasarDesktopApp(QMainWindow):
         if model:
             self.model = model
 
+    def _restore_microphone_selection(self) -> int | None:
+        saved_name = self.settings.value(
+            "audio/input_device_name",
+            "",
+            type=str,
+        )
+        saved_host_api = self.settings.value(
+            "audio/input_device_host_api",
+            -1,
+            type=int,
+        )
+        saved_input_channels = self.settings.value(
+            "audio/input_device_channels",
+            -1,
+            type=int,
+        )
+        saved_index = self.settings.value("audio/input_device", -1, type=int)
+        if not saved_name and saved_index < 0:
+            return None
+
+        try:
+            import sounddevice as sd
+        except ImportError as error:
+            self.microphone_notice = f"마이크 설정을 불러오지 못했습니다: {error}"
+            return None
+
+        try:
+            devices = sd.query_devices()
+        except sd.PortAudioError as error:
+            self.microphone_notice = f"마이크 목록을 불러오지 못했습니다: {error}"
+            return None
+
+        if saved_name and saved_host_api >= 0:
+            device_index = find_input_device_index(
+                devices,
+                saved_name,
+                saved_host_api,
+                saved_input_channels if saved_input_channels > 0 else None,
+            )
+            if device_index is not None:
+                return device_index
+            self.microphone_notice = (
+                "저장된 마이크를 찾지 못해 시스템 기본 마이크를 사용합니다. "
+                "설정에서 입력 장치를 확인해 주세요."
+            )
+            return None
+
+        if saved_index < len(devices) and saved_index >= 0:
+            device = devices[saved_index]
+            if int(device["max_input_channels"]) > 0:
+                self.settings.setValue("audio/input_device_name", device["name"])
+                self.settings.setValue(
+                    "audio/input_device_host_api",
+                    int(device["hostapi"]),
+                )
+                self.settings.setValue(
+                    "audio/input_device_channels",
+                    int(device["max_input_channels"]),
+                )
+                self.settings.sync()
+                return saved_index
+
+        self.settings.setValue("audio/input_device", -1)
+        self.settings.sync()
+        self.microphone_notice = (
+            "저장된 장치가 마이크가 아니어서 시스템 기본 마이크를 사용합니다. "
+            "설정에서 입력 장치를 확인해 주세요."
+        )
+        return None
+
+    def _open_settings(self) -> None:
+        dialog = MicrophoneSettingsDialog(
+            self.microphone_device_index,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_device_index = dialog.selected_device_index
+        selected_device: Any = None
+        if selected_device_index is not None:
+            try:
+                import sounddevice as sd
+            except ImportError as error:
+                QMessageBox.warning(
+                    self,
+                    "마이크 설정 실패",
+                    f"마이크 기능을 사용할 수 없습니다: {error}",
+                )
+                return
+            try:
+                devices = sd.query_devices()
+            except sd.PortAudioError as error:
+                QMessageBox.warning(
+                    self,
+                    "마이크 설정 실패",
+                    f"마이크 목록을 불러오지 못했습니다: {error}",
+                )
+                return
+            if selected_device_index >= len(devices):
+                QMessageBox.warning(
+                    self,
+                    "마이크 설정 실패",
+                    "선택한 마이크를 찾을 수 없습니다. 목록을 새로고침해 주세요.",
+                )
+                return
+            selected_device = devices[selected_device_index]
+            if int(selected_device["max_input_channels"]) < 1:
+                QMessageBox.warning(
+                    self,
+                    "마이크 설정 실패",
+                    "선택한 장치는 마이크 입력을 지원하지 않습니다.",
+                )
+                return
+
+        self.settings.setValue(
+            "audio/input_device",
+            selected_device_index
+            if selected_device_index is not None
+            else -1,
+        )
+        if selected_device is None:
+            self.settings.remove("audio/input_device_name")
+            self.settings.remove("audio/input_device_host_api")
+            self.settings.remove("audio/input_device_channels")
+        else:
+            self.settings.setValue(
+                "audio/input_device_name",
+                selected_device["name"],
+            )
+            self.settings.setValue(
+                "audio/input_device_host_api",
+                int(selected_device["hostapi"]),
+            )
+            self.settings.setValue(
+                "audio/input_device_channels",
+                int(selected_device["max_input_channels"]),
+            )
+        self.settings.sync()
+        if self.settings.status() != QSettings.Status.NoError:
+            QMessageBox.warning(
+                self,
+                "설정 저장 실패",
+                "마이크 선택을 저장하지 못했습니다. 다시 시도해 주세요.",
+            )
+            return
+        self.microphone_device_index = selected_device_index
+        self.microphone_notice = None
+        self.status_label.setText(
+            f"입력 마이크: {dialog.selected_device_name}"
+        )
+
     def _load_model_options(self) -> None:
         if self.client is None or self.busy:
             return
@@ -821,22 +1172,28 @@ class QuasarDesktopApp(QMainWindow):
         self.model_selector.blockSignals(False)
         self.refresh_models_button.setEnabled(True)
         if errors:
-            self.status_label.setText(
+            status = (
                 f"모델 목록을 모두 불러오지 못했습니다. 이름을 직접 입력할 수 있습니다. "
                 f"({errors[0]})"
             )
+            if self.microphone_notice:
+                status = f"{status} · {self.microphone_notice}"
+            self.status_label.setText(status)
         else:
             self._refresh_status()
 
     def _refresh_status(self) -> None:
         if self.startup_error:
-            self.status_label.setText(
+            status = (
                 f"AI 연결 설정을 확인해 주세요: {self.startup_error}"
             )
         elif self.client is not None:
-            self.status_label.setText(
-                f"{self.provider.upper()} · {self.model or '모델을 선택하세요'}"
-            )
+            status = f"{self.provider.upper()} · {self.model or '모델을 선택하세요'}"
+        else:
+            return
+        if self.microphone_notice:
+            status = f"{status} · {self.microphone_notice}"
+        self.status_label.setText(status)
 
     def _configure_agent(self) -> None:
         agent.current_directory = Path(__file__).resolve().parent
@@ -853,7 +1210,15 @@ class QuasarDesktopApp(QMainWindow):
                 action = "실행" if name == "execute_cmd" else "예약"
                 if not isinstance(command, str):
                     return "명령이 문자열이 아닙니다."
-                if not self._request_command_approval(command, action):
+                reason = command_approval_reason(
+                    command,
+                    scheduled=name == "schedule_command",
+                )
+                if reason and not self._request_command_approval(
+                    command,
+                    action,
+                    reason,
+                ):
                     return f"명령 {action}이 사용자에 의해 거부되었습니다."
                 previous = agent.auto_approve_commands
                 agent.auto_approve_commands = True
@@ -904,6 +1269,11 @@ class QuasarDesktopApp(QMainWindow):
         self.composer.clear()
         self.messages.append({"role": "user", "content": prompt})
         self._add_message("user", prompt)
+        _activity_bubble, self.activity_body = self._add_message(
+            "assistant",
+            "요청을 분석하고 있습니다...",
+            streaming=True,
+        )
         self.busy = True
         self._set_busy(True)
         client = self.client
@@ -925,6 +1295,7 @@ class QuasarDesktopApp(QMainWindow):
                 prompt,
                 live_analysis_server=None,
                 mcp_manager=None,
+                progress_callback=self.signals.request_progress.emit,
             )
         except Exception as error:
             self.signals.request_failed.emit(
@@ -944,6 +1315,7 @@ class QuasarDesktopApp(QMainWindow):
             self.voice_stop_event,
             self.voice_recognizer,
             self.signals,
+            self.microphone_device_index,
         )
         self.voice_worker = worker
         worker.start()
@@ -1004,50 +1376,30 @@ class QuasarDesktopApp(QMainWindow):
         if not self.closing:
             self.status_label.setText(f"음성 출력 실패: {error}")
 
-    def _finish_with_response(self, response: str) -> None:
+    def _show_request_progress(self, progress: str) -> None:
         if self.closing:
             return
-        self.pending_response = response
-        _bubble, self.response_body = self._add_message(
-            "assistant", "", streaming=True
-        )
-        self.response_body.setTextFormat(Qt.TextFormat.PlainText)
-        self.response_position = 0
-        self.chat_scroll.verticalScrollBar().setValue(
-            self.chat_scroll.verticalScrollBar().maximum()
-        )
-        self.response_timer.start()
-
-    def _stream_response_chunk(self) -> None:
-        if self.closing or self.pending_response is None or self.response_body is None:
-            self.response_timer.stop()
-            return
-        if self.response_position < len(self.pending_response):
-            next_position = min(
-                self.response_position + 3, len(self.pending_response)
-            )
-            self.response_body.setText(
-                self.pending_response[:next_position]
-            )
-            self.response_position = next_position
+        if self.activity_body is not None:
+            current_text = self.activity_body.text()
+            self.activity_body.setText(f"{current_text}\n{progress}")
             self.chat_scroll.verticalScrollBar().setValue(
                 self.chat_scroll.verticalScrollBar().maximum()
             )
-            return
+        self.status_label.setText(progress)
 
-        self.response_timer.stop()
-        self.response_body.setTextFormat(Qt.TextFormat.MarkdownText)
-        self.response_body.setText(self.pending_response)
-        completed_response = self.pending_response
-        self.pending_response = None
-        self.response_body = None
+    def _finish_with_response(self, response: str) -> None:
+        if self.closing:
+            return
+        self.activity_body = None
+        self._add_message("assistant", response)
         self._set_busy(False)
         if self.voice_response_toggle.isChecked():
-            self._speak_response(completed_response)
+            self._speak_response(response)
 
     def _finish_with_error(self, error: str) -> None:
         if self.closing:
             return
+        self.activity_body = None
         self._add_message("assistant", f"요청 처리 실패: {error}")
         self._set_busy(False)
 
@@ -1122,10 +1474,15 @@ class QuasarDesktopApp(QMainWindow):
         )
         return bubble, body
 
-    def _request_command_approval(self, command: str, action: str) -> bool:
+    def _request_command_approval(
+        self,
+        command: str,
+        action: str,
+        reason: str,
+    ) -> bool:
         decision: dict[str, Any] = {"approved": False, "event": threading.Event()}
         self.pending_approvals.append(decision)
-        self.signals.approval_requested.emit(command, action, decision)
+        self.signals.approval_requested.emit(command, action, reason, decision)
         decision["event"].wait()
         if decision in self.pending_approvals:
             self.pending_approvals.remove(decision)
@@ -1135,6 +1492,7 @@ class QuasarDesktopApp(QMainWindow):
         self,
         command: str,
         action: str,
+        reason: str,
         decision: dict[str, Any],
     ) -> None:
         if self.closing:
@@ -1143,7 +1501,7 @@ class QuasarDesktopApp(QMainWindow):
         dialog = QMessageBox(self)
         dialog.setWindowTitle(f"명령 {action} 승인")
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setText(f"이 명령을 {action}할까요?")
+        dialog.setText(f"{reason}\n이 명령을 {action}할까요?")
         dialog.setInformativeText(command)
         dialog.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         dialog.setStandardButtons(
