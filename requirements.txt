@@ -12,4 +12,6 @@ qiskit
 qiskit-aer
 numpy
 sounddevice
-pyttsx3
+av
+edge-tts
+python-pptx

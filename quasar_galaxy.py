@@ -25,7 +25,7 @@ from PySide6.QtGui import (
     QPen,
     QRadialGradient,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QLabel, QWidget
 
 # 메시지가 블랙홀에 빨려 들어가는 시간(ms). 오브와 오버레이가 같은 값을 공유합니다.
 SWALLOW_MS = 1300
@@ -482,6 +482,8 @@ class _GalaxyOrbitLayer(QWidget):
 
 
 class GalaxyTransitionOverlay(QWidget):
+    expanded_changed = Signal(bool)
+
     def __init__(
         self,
         parent: QWidget,
@@ -496,6 +498,7 @@ class GalaxyTransitionOverlay(QWidget):
         self._animation_origin = 0.0
         self._animation_target = 0.0
         self._animation_started = 0.0
+        self._animation_complete = False
         self._source_geometry = QRectF()
         self._duration = 1.45
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -529,10 +532,34 @@ class GalaxyTransitionOverlay(QWidget):
             for _ in range(48)
         ]
         self.orbit_layer = _GalaxyOrbitLayer(self)
+        self.conversation_status = QLabel(
+            "은하 대화를 준비하고 있습니다...",
+            self,
+        )
+        self.conversation_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.conversation_status.setWordWrap(True)
+        self.conversation_status.setStyleSheet(
+            "color: #e7eaff; background: rgba(7, 10, 22, 185);"
+            "border: 1px solid rgba(155, 145, 255, 90);"
+            "border-radius: 12px; padding: 10px 18px;"
+            "font-size: 13px; font-weight: 600;"
+        )
         self.timer = QTimer(self)
         self.timer.setInterval(16)
         self.timer.timeout.connect(self._advance)
         self.hide()
+
+    def set_conversation_status(self, status: str) -> None:
+        self.conversation_status.setText(status)
+
+    def resizeEvent(self, event: Any) -> None:
+        self.conversation_status.setGeometry(
+            32,
+            28,
+            max(1, self.width() - 64),
+            54,
+        )
+        super().resizeEvent(event)
 
     def toggle(self) -> None:
         if not self.isVisible():
@@ -556,6 +583,7 @@ class GalaxyTransitionOverlay(QWidget):
             self.progress = 0.0
             self._animation_origin = 0.0
             self._animation_target = 1.0
+            self._animation_complete = False
             self.show()
             self.raise_()
             self.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -563,9 +591,12 @@ class GalaxyTransitionOverlay(QWidget):
         else:
             self._animation_origin = self.progress
             self._animation_target = 0.0 if self._animation_target > 0.5 else 1.0
+            self._animation_complete = False
 
+        self.expanded_changed.emit(self._animation_target > 0.5)
         self.orb.raise_()
         self.orbit_layer.raise_()
+        self.conversation_status.raise_()
         self._animation_started = time.perf_counter()
         self.timer.start()
 
@@ -628,10 +659,12 @@ class GalaxyTransitionOverlay(QWidget):
         self.orbit_layer.setGeometry(self.rect())
         self.orb.raise_()
         self.orbit_layer.raise_()
+        self.conversation_status.raise_()
         self.update()
         self.orbit_layer.update()
 
-        if elapsed >= 1.0:
+        if elapsed >= 1.0 and not self._animation_complete:
+            self._animation_complete = True
             self.progress = self._animation_target
             if self.progress == 0.0:
                 self.timer.stop()

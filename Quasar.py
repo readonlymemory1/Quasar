@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
+import queue
 import re
+import secrets
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import wave
+from collections import deque
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import quasar_cli as agent
-from PySide6.QtCore import QObject, QSettings, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from quasar_galaxy import (
     CANVAS_BACKGROUND_STOPS,
@@ -49,7 +58,9 @@ MUTED = "#929bb8"
 ACCENT = "#9b91ff"
 
 SYSTEM_PROMPT = (
-    "You are Quasar. Respond concisely and accurately in Korean. "
+    "You are Quasar. Respond concisely and accurately in the language the user uses, "
+    "especially Korean or English. "
+    "When the user asks to turn spoken responses on or off, use the set_tts_enabled tool. "
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
     "Run requested commands without showing confirmation dialogs. "
     "Send email only when explicitly requested, and clarify ambiguous requests first. "
@@ -59,6 +70,11 @@ SYSTEM_PROMPT = (
 )
 
 NEMO_SPEECH_MODEL = "nemotron-3.5"
+SPEECH_OUTPUT_GAIN = 3.0
+VOICE_RECOGNITION_SAMPLE_RATE = 16_000
+VOICE_INPUT_MAX_GAIN = 2.0
+VOICE_INPUT_TARGET_PEAK = 0.35
+VOICE_CONVERSATION_END_SILENCE_SECONDS = 0.6
 
 class AppSignals(QObject):
     response_ready = Signal(str)
@@ -68,8 +84,15 @@ class AppSignals(QObject):
     voice_status = Signal(str)
     voice_text_ready = Signal(str)
     voice_failed = Signal(str)
+    conversation_voice_text_ready = Signal(str)
+    conversation_voice_failed = Signal(str)
     speech_finished = Signal()
     speech_failed = Signal(str)
+    tts_enabled_requested = Signal(bool)
+    audio_test_ready = Signal(object)
+    audio_test_failed = Signal(str)
+    audio_test_playback_finished = Signal()
+    audio_test_playback_failed = Signal(str)
 
 
 class VoicePushButton(QPushButton):
@@ -134,6 +157,45 @@ class MicrophoneSettingsDialog(QDialog):
         )
         layout.addWidget(self.refresh_microphones_button)
 
+        audio_test_description = QLabel(
+            "녹음 후 재생하면 AI 인식기에 전달되는 처리된 소리를 확인할 수 있습니다."
+        )
+        audio_test_description.setWordWrap(True)
+        audio_test_description.setStyleSheet(f"color: {MUTED};")
+        layout.addWidget(audio_test_description)
+
+        audio_test_buttons = QHBoxLayout()
+        self.audio_test_record_button = QPushButton("녹음 테스트 시작")
+        self.audio_test_record_button.clicked.connect(
+            self._toggle_audio_test_recording
+        )
+        audio_test_buttons.addWidget(self.audio_test_record_button)
+        self.audio_test_play_button = QPushButton("처리된 음성 듣기")
+        self.audio_test_play_button.setEnabled(False)
+        self.audio_test_play_button.clicked.connect(self._toggle_audio_test_playback)
+        audio_test_buttons.addWidget(self.audio_test_play_button)
+        layout.addLayout(audio_test_buttons)
+
+        self.audio_test_status = QLabel("선택한 마이크를 녹음하고 확인하세요.")
+        self.audio_test_status.setWordWrap(True)
+        self.audio_test_status.setStyleSheet(f"color: {MUTED};")
+        layout.addWidget(self.audio_test_status)
+
+        self.audio_test_signals = AppSignals(self)
+        self.audio_test_signals.audio_test_ready.connect(self._audio_test_ready)
+        self.audio_test_signals.audio_test_failed.connect(self._audio_test_failed)
+        self.audio_test_signals.audio_test_playback_finished.connect(
+            self._audio_test_playback_finished
+        )
+        self.audio_test_signals.audio_test_playback_failed.connect(
+            self._audio_test_playback_failed
+        )
+        self.audio_test_samples: Any = None
+        self.audio_test_stop_event: threading.Event | None = None
+        self.audio_test_worker: VoiceInputTestWorker | None = None
+        self.audio_playback_stop_event: threading.Event | None = None
+        self.audio_playback_worker: VoicePlaybackTestWorker | None = None
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -153,6 +215,103 @@ class MicrophoneSettingsDialog(QDialog):
     @property
     def selected_device_name(self) -> str:
         return self.microphone_selector.currentText()
+
+    def _toggle_audio_test_recording(self) -> None:
+        if self.audio_test_worker is not None and self.audio_test_worker.is_alive():
+            if self.audio_test_stop_event is not None:
+                self.audio_test_stop_event.set()
+            self.audio_test_record_button.setEnabled(False)
+            self.audio_test_status.setText("녹음을 마무리하는 중입니다...")
+            return
+
+        selected_device_index = self.selected_device_index
+        self.audio_test_stop_event = threading.Event()
+        self.audio_test_worker = VoiceInputTestWorker(
+            self.audio_test_stop_event,
+            self.audio_test_signals,
+            selected_device_index,
+        )
+        self.microphone_selector.setEnabled(False)
+        self.refresh_microphones_button.setEnabled(False)
+        self.audio_test_record_button.setText("녹음 중지")
+        self.audio_test_play_button.setEnabled(False)
+        self.audio_test_status.setText(
+            "녹음 중입니다. 말한 뒤 '녹음 중지'를 누르세요."
+        )
+        self.audio_test_worker.start()
+
+    def _audio_test_ready(self, samples: Any) -> None:
+        self.audio_test_samples = samples
+        self._reset_audio_test_recording_controls()
+        self.audio_test_play_button.setEnabled(True)
+        self.audio_test_status.setText(
+            "녹음 완료. '처리된 음성 듣기'로 AI가 받는 소리를 확인하세요."
+        )
+
+    def _audio_test_failed(self, error: str) -> None:
+        self._reset_audio_test_recording_controls()
+        self.audio_test_status.setText(f"마이크 테스트 실패: {error}")
+
+    def _reset_audio_test_recording_controls(self) -> None:
+        self.audio_test_worker = None
+        self.audio_test_stop_event = None
+        self.microphone_selector.setEnabled(True)
+        self.refresh_microphones_button.setEnabled(True)
+        self.audio_test_record_button.setEnabled(True)
+        self.audio_test_record_button.setText("녹음 테스트 시작")
+
+    def _toggle_audio_test_playback(self) -> None:
+        if (
+            self.audio_playback_worker is not None
+            and self.audio_playback_worker.is_alive()
+        ):
+            if self.audio_playback_stop_event is not None:
+                self.audio_playback_stop_event.set()
+            self.audio_test_play_button.setEnabled(False)
+            self.audio_test_status.setText("재생을 중지하는 중입니다...")
+            return
+        if self.audio_test_samples is None:
+            return
+
+        self.audio_playback_stop_event = threading.Event()
+        self.audio_playback_worker = VoicePlaybackTestWorker(
+            self.audio_test_samples,
+            self.audio_playback_stop_event,
+            self.audio_test_signals,
+        )
+        self.audio_test_play_button.setText("재생 중지")
+        self.audio_test_status.setText(
+            "AI 인식기에 전달되는 처리 음성을 재생합니다..."
+        )
+        self.audio_playback_worker.start()
+
+    def _audio_test_playback_finished(self) -> None:
+        self._reset_audio_test_playback_controls()
+        self.audio_test_status.setText("재생이 끝났습니다.")
+
+    def _audio_test_playback_failed(self, error: str) -> None:
+        self._reset_audio_test_playback_controls()
+        self.audio_test_status.setText(f"음성 재생 실패: {error}")
+
+    def _reset_audio_test_playback_controls(self) -> None:
+        self.audio_playback_worker = None
+        self.audio_playback_stop_event = None
+        self.audio_test_play_button.setEnabled(self.audio_test_samples is not None)
+        self.audio_test_play_button.setText("처리된 음성 듣기")
+
+    def _stop_audio_test_workers(self) -> None:
+        if self.audio_test_stop_event is not None:
+            self.audio_test_stop_event.set()
+        if self.audio_playback_stop_event is not None:
+            self.audio_playback_stop_event.set()
+
+    def accept(self) -> None:
+        self._stop_audio_test_workers()
+        super().accept()
+
+    def reject(self) -> None:
+        self._stop_audio_test_workers()
+        super().reject()
 
     def refresh_microphones(self, preferred_device_index: int | None = None) -> None:
         if preferred_device_index is None:
@@ -236,6 +395,15 @@ class LocalSpeechRecognizer:
         self.model_lock = threading.Lock()
         self.runtime_environment: dict[str, str] | None = None
         self.runtime_temp_dir: Path | None = None
+        self.server_process: subprocess.Popen[bytes] | None = None
+        self.server_url: str | None = None
+        self.server_model: str | None = None
+        self.server_api_key: str | None = None
+        self.server_client: Any = None
+        self.server_log_path: Path | None = None
+        self.server_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self.server_lock = threading.Lock()
+        self.closed = False
 
     def _prepare_runtime_paths(self) -> tuple[dict[str, str], Path]:
         environment = os.environ.copy()
@@ -297,37 +465,221 @@ class LocalSpeechRecognizer:
 
         return environment, temp_dir
 
-    def transcribe(self, audio: Any, signals: AppSignals) -> None:
-        with self.model_lock:
-            import numpy as np
+    def _find_executable(self) -> str:
+        executable = shutil.which("nemo-speech")
+        if executable is None:
+            local_app_data = os.getenv("LOCALAPPDATA")
+            if local_app_data:
+                candidate = (
+                    Path(local_app_data)
+                    / "Programs"
+                    / "NeMoSpeech"
+                    / "bin"
+                    / "nemo-speech.exe"
+                )
+                if candidate.is_file():
+                    executable = str(candidate)
+        if executable is None:
+            raise RuntimeError(
+                "양자화 음성 인식 런타임이 없습니다. NVIDIA NeMo-Speech.cpp를 "
+                "설치한 뒤 새 터미널에서 다시 실행해 주세요."
+            )
+        return executable
+
+    def start_server(self) -> None:
+        with self.server_lock:
+            if self.closed:
+                raise RuntimeError("음성 인식기가 종료되었습니다.")
+            if self.server_process is not None:
+                if self.server_process.poll() is None:
+                    return
+                self._release_server_resources()
 
             if self.runtime_environment is None or self.runtime_temp_dir is None:
                 (
                     self.runtime_environment,
                     self.runtime_temp_dir,
                 ) = self._prepare_runtime_paths()
-            executable = shutil.which("nemo-speech")
-            if executable is None:
-                local_app_data = os.getenv("LOCALAPPDATA")
-                if local_app_data:
-                    candidate = (
-                        Path(local_app_data)
-                        / "Programs"
-                        / "NeMoSpeech"
-                        / "bin"
-                        / "nemo-speech.exe"
-                    )
-                    if candidate.is_file():
-                        executable = str(candidate)
-            if executable is None:
-                raise RuntimeError(
-                    "양자화 음성 인식 런타임이 없습니다. NVIDIA NeMo-Speech.cpp를 "
-                    "설치한 뒤 새 터미널에서 다시 실행해 주세요."
-                )
-            signals.voice_status.emit(
-                "Nemotron Q8 양자화 모델로 음성을 인식하는 중입니다. "
-                "첫 실행은 모델을 다운로드할 수 있습니다..."
+
+            executable = self._find_executable()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+
+            self.server_temp_dir = tempfile.TemporaryDirectory(
+                prefix="quasar-asr-server-",
+                dir=self.runtime_temp_dir,
             )
+            self.server_log_path = Path(self.server_temp_dir.name) / "server.log"
+            self.server_api_key = secrets.token_urlsafe(32)
+            command = [
+                executable,
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--asr-model",
+                NEMO_SPEECH_MODEL,
+                "--device",
+                "auto",
+                "--no-ui",
+                "--api-key",
+                self.server_api_key,
+            ]
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                with self.server_log_path.open("wb") as log_file:
+                    self.server_process = subprocess.Popen(
+                        command,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        env=self.runtime_environment,
+                        creationflags=creation_flags,
+                    )
+            except OSError as error:
+                self._release_server_resources()
+                raise RuntimeError(
+                    f"로컬 음성 인식 서버를 시작하지 못했습니다: {error}"
+                ) from error
+            self.server_url = f"http://127.0.0.1:{port}"
+
+    def _release_server_resources(self) -> None:
+        self.server_process = None
+        self.server_url = None
+        self.server_model = None
+        self.server_api_key = None
+        self.server_log_path = None
+        if self.server_temp_dir is not None:
+            self.server_temp_dir.cleanup()
+            self.server_temp_dir = None
+        if self.server_client is not None:
+            self.server_client.close()
+            self.server_client = None
+
+    def _server_error_detail(self) -> str:
+        if self.server_log_path is None or not self.server_log_path.is_file():
+            return ""
+        return self.server_log_path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+
+    def _wait_for_server(self, stop_event: threading.Event | None = None) -> None:
+        self.start_server()
+        server_url = self.server_url
+        server_process = self.server_process
+        if server_url is None or server_process is None:
+            raise RuntimeError("로컬 음성 인식 서버 주소를 설정하지 못했습니다.")
+        if self.server_model is not None:
+            return
+
+        deadline = time.monotonic() + 900
+        ready_url = f"{server_url}/ready"
+        models_url = f"{server_url}/v1/models"
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("음성 인식 요청이 취소되었습니다.")
+            process_status = server_process.poll()
+            if process_status is not None:
+                detail = self._server_error_detail()
+                raise RuntimeError(
+                    "로컬 음성 인식 서버가 준비되기 전에 종료되었습니다"
+                    f" (코드 {process_status}). {detail}"
+                )
+            try:
+                with urlopen(ready_url, timeout=1) as response:
+                    readiness = json.loads(response.read())
+                if readiness.get("ready") is True:
+                    if self.server_api_key is None:
+                        raise RuntimeError(
+                            "로컬 음성 인식 서버 API 키가 설정되지 않았습니다."
+                        )
+                    request = Request(
+                        models_url,
+                        headers={
+                            "Authorization": f"Bearer {self.server_api_key}"
+                        },
+                    )
+                    with urlopen(request, timeout=1) as response:
+                        models = json.loads(response.read()).get("data", [])
+                    asr_model = next(
+                        (
+                            model
+                            for model in models
+                            if model.get("capability") == "transcription"
+                        ),
+                        None,
+                    )
+                    if asr_model is None and models:
+                        asr_model = models[0]
+                    if asr_model is None or not isinstance(asr_model.get("id"), str):
+                        raise RuntimeError(
+                            "로컬 음성 인식 서버가 사용할 모델을 제공하지 않습니다."
+                        )
+                    self.server_model = asr_model["id"]
+                    return
+                time.sleep(0.15)
+            except (URLError, TimeoutError, OSError):
+                time.sleep(0.15)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"로컬 음성 인식 서버 응답을 읽을 수 없습니다: {error}"
+                ) from error
+
+        raise TimeoutError(
+            "로컬 음성 인식 서버가 15분 안에 준비되지 않았습니다. "
+            f"{self._server_error_detail()}"
+        )
+
+    def _get_server_client(self) -> Any:
+        with self.server_lock:
+            if self.closed:
+                raise RuntimeError("음성 인식기가 종료되었습니다.")
+            if self.server_client is None:
+                from openai import OpenAI
+
+                if (
+                    self.server_url is None
+                    or self.server_model is None
+                    or self.server_api_key is None
+                ):
+                    raise RuntimeError("로컬 음성 인식 서버가 시작되지 않았습니다.")
+                self.server_client = OpenAI(
+                    base_url=f"{self.server_url}/v1",
+                    api_key=self.server_api_key,
+                    timeout=900,
+                    max_retries=0,
+                )
+            return self.server_client
+
+    def close(self) -> None:
+        with self.server_lock:
+            self.closed = True
+            process = self.server_process
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            self._release_server_resources()
+
+    def transcribe(
+        self,
+        audio: Any,
+        signals: AppSignals,
+        *,
+        conversation: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        with self.model_lock:
+            import numpy as np
+
+            signals.voice_status.emit("로컬 음성 인식기를 준비하는 중입니다...")
+            self._wait_for_server(stop_event)
+            signals.voice_status.emit("음성을 로컬에서 인식하는 중입니다...")
             samples = np.asarray(audio, dtype=np.float32)
             pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
 
@@ -339,43 +691,25 @@ class LocalSpeechRecognizer:
                 with wave.open(str(audio_path), "wb") as wav_file:
                     wav_file.setnchannels(1)
                     wav_file.setsampwidth(2)
-                    wav_file.setframerate(16_000)
+                    wav_file.setframerate(VOICE_RECOGNITION_SAMPLE_RATE)
                     wav_file.writeframes(pcm_samples.tobytes())
 
-                try:
-                    result = subprocess.run(
-                        [
-                            executable,
-                            "transcribe",
-                            str(audio_path),
-                            "--model",
-                            NEMO_SPEECH_MODEL,
-                            "--language",
-                            "ko-KR",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=900,
-                        check=False,
-                        env=self.runtime_environment,
+                client = self._get_server_client()
+                with audio_path.open("rb") as audio_file:
+                    result = client.audio.transcriptions.create(
+                        model=self.server_model,
+                        file=audio_file,
                     )
-                except subprocess.TimeoutExpired as error:
-                    raise RuntimeError(
-                        "양자화 음성 인식이 15분 내에 끝나지 않았습니다."
-                    ) from error
 
-            if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip()
-                raise RuntimeError(
-                    f"Nemotron 양자화 음성 인식 실패: {detail or result.returncode}"
-                )
-            transcript = result.stdout.strip()
+            transcript = result.text.strip()
+            transcript = re.sub(r"\s+[a-z]{2,3}-[A-Z]{2,3}\s*$", "", transcript)
 
         if not transcript:
             raise RuntimeError("음성을 인식하지 못했습니다. 다시 말씀해 주세요.")
-        signals.voice_text_ready.emit(transcript)
+        if conversation:
+            signals.conversation_voice_text_ready.emit(transcript)
+        else:
+            signals.voice_text_ready.emit(transcript)
 
 
 class VoiceCaptureWorker(threading.Thread):
@@ -394,7 +728,6 @@ class VoiceCaptureWorker(threading.Thread):
 
     def run(self) -> None:
         try:
-            import numpy as np
             import sounddevice as sd
 
             input_device = (
@@ -442,20 +775,7 @@ class VoiceCaptureWorker(threading.Thread):
             if len(audio_data) < sample_rate:
                 raise RuntimeError("녹음이 너무 짧습니다. 조금 더 길게 말씀해 주세요.")
 
-            samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
-            samples /= 32768.0
-            target_rate = 16_000
-            if sample_rate != target_rate:
-                target_count = round(len(samples) * target_rate / sample_rate)
-                target_positions = np.arange(target_count) * sample_rate / target_rate
-                samples = np.interp(
-                    target_positions,
-                    np.arange(len(samples)),
-                    samples,
-                ).astype(np.float32)
-            peak = float(np.max(np.abs(samples)))
-            if 0 < peak < 0.7:
-                samples = np.clip(samples * min(4.0, 0.7 / peak), -1.0, 1.0)
+            samples = process_voice_input(audio_data, sample_rate)
 
             self.signals.voice_status.emit("녹음한 음성을 로컬에서 인식하는 중입니다...")
             self.recognizer.transcribe(samples, self.signals)
@@ -463,34 +783,407 @@ class VoiceCaptureWorker(threading.Thread):
             self.signals.voice_failed.emit(f"{type(error).__name__}: {error}")
 
 
+class VoiceConversationCaptureWorker(threading.Thread):
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        recognizer: LocalSpeechRecognizer,
+        signals: AppSignals,
+        device_index: int | None = None,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.stop_event = stop_event
+        self.recognizer = recognizer
+        self.signals = signals
+        self.device_index = device_index
+
+    def run(self) -> None:
+        try:
+            import numpy as np
+            import sounddevice as sd
+
+            input_device = (
+                sd.query_devices(kind="input")
+                if self.device_index is None
+                else sd.query_devices(self.device_index)
+            )
+            if int(input_device["max_input_channels"]) < 1:
+                raise RuntimeError(
+                    "선택한 장치는 마이크 입력을 지원하지 않습니다. "
+                    "설정에서 입력 마이크를 다시 선택해 주세요."
+                )
+            sample_rate = int(input_device["default_samplerate"])
+            if sample_rate <= 0:
+                raise RuntimeError("사용 가능한 마이크 샘플링 속도를 확인할 수 없습니다.")
+
+            audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=128)
+            callback_errors: list[str] = []
+
+            def capture_audio(
+                data: Any,
+                _frame_count: int,
+                _time_info: Any,
+                status: Any,
+            ) -> None:
+                if status:
+                    callback_errors.append(str(status))
+                try:
+                    audio_queue.put_nowait(bytes(data))
+                except queue.Full:
+                    callback_errors.append("마이크 입력 버퍼가 가득 찼습니다.")
+
+            self.signals.voice_status.emit(
+                "듣는 중... 편하게 말씀하시면 자동으로 전송합니다."
+            )
+            with sd.RawInputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=1024,
+                callback=capture_audio,
+                device=self.device_index,
+            ):
+                block_duration = 1024 / sample_rate
+                preroll: deque[bytes] = deque(
+                    maxlen=max(1, round(0.25 / block_duration))
+                )
+                onset: list[bytes] = []
+                speech: list[bytes] = []
+                onset_duration = 0.0
+                speech_duration = 0.0
+                voiced_duration = 0.0
+                silence_duration = 0.0
+                noise_floor = 0.0015
+                speaking = False
+
+                while not self.stop_event.is_set():
+                    if callback_errors:
+                        raise RuntimeError(f"마이크 입력 오류: {callback_errors[0]}")
+                    try:
+                        audio_block = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+                    samples = np.frombuffer(audio_block, dtype=np.int16).astype(
+                        np.float32
+                    )
+                    samples /= 32768.0
+                    samples -= float(np.mean(samples))
+                    rms = float(np.sqrt(np.mean(samples * samples)))
+                    threshold = max(0.004, noise_floor * 2.5)
+                    voiced = rms >= threshold
+                    block_duration = len(audio_block) / 2 / sample_rate
+
+                    if not speaking:
+                        if voiced:
+                            if not onset:
+                                onset = list(preroll)
+                                onset_duration = sum(
+                                    len(block) / 2 / sample_rate for block in onset
+                                )
+                                voiced_duration = 0.0
+                            onset.append(audio_block)
+                            onset_duration += block_duration
+                            voiced_duration += block_duration
+                            if voiced_duration >= 0.06:
+                                speech = onset
+                                speech_duration = onset_duration
+                                silence_duration = 0.0
+                                speaking = True
+                                onset = []
+                                self.signals.voice_status.emit(
+                                    "말씀을 듣고 있습니다..."
+                                )
+                        else:
+                            noise_floor = min(
+                                0.02,
+                                noise_floor * 0.98 + rms * 0.02,
+                            )
+                            onset = []
+                            onset_duration = 0.0
+                            voiced_duration = 0.0
+                            preroll.append(audio_block)
+                        continue
+
+                    speech.append(audio_block)
+                    speech_duration += block_duration
+                    if voiced:
+                        voiced_duration += block_duration
+                        silence_duration = 0.0
+                    else:
+                        silence_duration += block_duration
+
+                    if (
+                        silence_duration >= VOICE_CONVERSATION_END_SILENCE_SECONDS
+                        or speech_duration >= 30
+                    ):
+                        if voiced_duration >= 0.25:
+                            break
+                        speech = []
+                        speech_duration = 0.0
+                        voiced_duration = 0.0
+                        silence_duration = 0.0
+                        speaking = False
+                        preroll.clear()
+                        self.signals.voice_status.emit(
+                            "듣는 중... 편하게 말씀하시면 자동으로 전송합니다."
+                        )
+
+            if self.stop_event.is_set():
+                return
+            if callback_errors:
+                raise RuntimeError(f"마이크 입력 오류: {callback_errors[0]}")
+            samples = process_voice_input(b"".join(speech), sample_rate)
+            self.signals.voice_status.emit("음성을 로컬에서 인식하는 중입니다...")
+            self.recognizer.transcribe(
+                samples,
+                self.signals,
+                conversation=True,
+                stop_event=self.stop_event,
+            )
+        except Exception as error:
+            self.signals.conversation_voice_failed.emit(
+                f"{type(error).__name__}: {error}"
+            )
+
+
+def process_voice_input(audio_data: bytes, sample_rate: int) -> Any:
+    import numpy as np
+
+    if sample_rate <= 0:
+        raise ValueError("마이크 샘플링 속도는 0보다 커야 합니다.")
+    samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+    samples /= 32768.0
+    if samples.size == 0:
+        raise ValueError("녹음된 음성이 비어 있습니다.")
+    if sample_rate != VOICE_RECOGNITION_SAMPLE_RATE:
+        if sample_rate > VOICE_RECOGNITION_SAMPLE_RATE:
+            target_cutoff = VOICE_RECOGNITION_SAMPLE_RATE * 0.45
+            tap_count = max(31, round(161 * sample_rate / 48_000))
+            if tap_count % 2 == 0:
+                tap_count += 1
+            offsets = np.arange(tap_count, dtype=np.float32) - tap_count // 2
+            kernel = (
+                2
+                * target_cutoff
+                / sample_rate
+                * np.sinc(2 * target_cutoff / sample_rate * offsets)
+            )
+            kernel *= np.hanning(tap_count)
+            kernel /= np.sum(kernel)
+            padding = tap_count // 2
+            padded_samples = np.pad(samples, (padding, padding), mode="edge")
+            samples = np.convolve(
+                padded_samples,
+                kernel,
+                mode="valid",
+            ).astype(np.float32)
+        target_count = round(
+            len(samples) * VOICE_RECOGNITION_SAMPLE_RATE / sample_rate
+        )
+        target_positions = (
+            np.arange(target_count) * sample_rate / VOICE_RECOGNITION_SAMPLE_RATE
+        )
+        samples = np.interp(
+            target_positions,
+            np.arange(len(samples)),
+            samples,
+        ).astype(np.float32)
+    peak = float(np.max(np.abs(samples)))
+    if 0 < peak < VOICE_INPUT_TARGET_PEAK:
+        gain = min(VOICE_INPUT_MAX_GAIN, VOICE_INPUT_TARGET_PEAK / peak)
+        samples *= gain
+    return samples
+
+
+class VoiceInputTestWorker(threading.Thread):
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        signals: AppSignals,
+        device_index: int | None,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.stop_event = stop_event
+        self.signals = signals
+        self.device_index = device_index
+
+    def run(self) -> None:
+        try:
+            import sounddevice as sd
+
+            input_device = (
+                sd.query_devices(kind="input")
+                if self.device_index is None
+                else sd.query_devices(self.device_index)
+            )
+            if int(input_device["max_input_channels"]) < 1:
+                raise RuntimeError("선택한 장치는 마이크 입력을 지원하지 않습니다.")
+            sample_rate = int(input_device["default_samplerate"])
+            if sample_rate <= 0:
+                raise RuntimeError("마이크 샘플링 속도를 확인할 수 없습니다.")
+            frames: list[bytes] = []
+            callback_errors: list[str] = []
+
+            def capture_audio(
+                data: Any,
+                _frame_count: int,
+                _time_info: Any,
+                status: Any,
+            ) -> None:
+                if status:
+                    callback_errors.append(str(status))
+                frames.append(bytes(data))
+
+            with sd.RawInputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=1024,
+                callback=capture_audio,
+                device=self.device_index,
+            ):
+                while not self.stop_event.wait(0.1):
+                    if callback_errors:
+                        raise RuntimeError(f"마이크 입력 오류: {callback_errors[0]}")
+
+            if callback_errors:
+                raise RuntimeError(f"마이크 입력 오류: {callback_errors[0]}")
+            audio_data = b"".join(frames)
+            if len(audio_data) < sample_rate * 2:
+                raise RuntimeError("녹음이 너무 짧습니다. 1초 이상 녹음해 주세요.")
+            self.signals.audio_test_ready.emit(
+                process_voice_input(audio_data, sample_rate)
+            )
+        except Exception as error:
+            self.signals.audio_test_failed.emit(
+                f"{type(error).__name__}: {error}"
+            )
+
+
+class VoicePlaybackTestWorker(threading.Thread):
+    def __init__(
+        self,
+        samples: Any,
+        stop_event: threading.Event,
+        signals: AppSignals,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.samples = samples
+        self.stop_event = stop_event
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            import sounddevice as sd
+
+            sd.play(self.samples, VOICE_RECOGNITION_SAMPLE_RATE)
+            while not self.stop_event.wait(0.1):
+                stream = sd.get_stream()
+                if stream is None or not stream.active:
+                    break
+            if self.stop_event.is_set():
+                sd.stop()
+            sd.wait()
+        except Exception as error:
+            self.signals.audio_test_playback_failed.emit(
+                f"{type(error).__name__}: {error}"
+            )
+            return
+        self.signals.audio_test_playback_finished.emit()
+
+
 class LocalSpeechOutputWorker(threading.Thread):
     def __init__(self, text: str, signals: AppSignals) -> None:
         super().__init__(daemon=True)
         self.text = text
         self.signals = signals
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
 
     def run(self) -> None:
         try:
-            import pyttsx3
+            import numpy as np
+            import av
+            import sounddevice as sd
 
-            engine = pyttsx3.init("sapi5")
-            voices = engine.getProperty("voices")
-            korean_voice = next(
-                (
-                    voice
-                    for voice in voices
-                    if any(
-                        name in voice.name.casefold()
-                        for name in ("korean", "heami", "huihui")
-                    )
-                ),
-                None,
+            contains_korean = any(
+                "\uac00" <= character <= "\ud7a3" for character in self.text
             )
-            if korean_voice is not None:
-                engine.setProperty("voice", korean_voice.id)
-            engine.say(self.text)
-            engine.runAndWait()
-            engine.stop()
+            voice = (
+                "ko-KR-SunHiNeural"
+                if contains_korean
+                else "en-US-AriaNeural"
+            )
+            with tempfile.TemporaryDirectory(prefix="quasar-speech-") as temp_dir:
+                text_path = Path(temp_dir) / "speech.txt"
+                audio_path = Path(temp_dir) / "speech.mp3"
+                text_path.write_text(self.text, encoding="utf-8")
+                command = [
+                    sys.executable,
+                    "-m",
+                    "edge_tts",
+                    "--file",
+                    str(text_path),
+                    "--voice",
+                    voice,
+                    "--write-media",
+                    str(audio_path),
+                    "--no-progress",
+                ]
+                for attempt in range(2):
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=90,
+                        check=False,
+                    )
+                    if result.returncode == 0:
+                        break
+                    details = result.stderr.strip() or result.stdout.strip()
+                    if attempt == 0 and "NoAudioReceived" in details:
+                        time.sleep(1)
+                        continue
+                    raise RuntimeError(
+                        f"Edge 음성 합성에 실패했습니다: {details or result.returncode}"
+                    )
+
+                with av.open(str(audio_path)) as container:
+                    audio_stream = container.streams.audio[0]
+                    sample_rate = int(audio_stream.rate or 24_000)
+                    resampler = av.AudioResampler(
+                        format="fltp",
+                        layout="mono",
+                        rate=sample_rate,
+                    )
+                    frames = []
+                    for frame in container.decode(audio_stream):
+                        frames.extend(resampler.resample(frame))
+                    frames.extend(resampler.resample(None))
+                if not frames:
+                    raise RuntimeError(
+                        "Edge 음성 서비스에서 재생할 오디오를 받지 못했습니다."
+                    )
+
+                samples = np.concatenate(
+                    [frame.to_ndarray().reshape(-1) for frame in frames]
+                ).astype(np.float32)
+                samples = np.tanh(samples * SPEECH_OUTPUT_GAIN) / math.tanh(
+                    SPEECH_OUTPUT_GAIN
+                )
+                if not self.stop_event.is_set():
+                    sd.play(samples, sample_rate)
+                    while not self.stop_event.wait(0.05):
+                        stream = sd.get_stream()
+                        if stream is None or not stream.active:
+                            break
+                    if self.stop_event.is_set():
+                        sd.stop()
         except Exception as error:
             self.signals.speech_failed.emit(f"{type(error).__name__}: {error}")
             return
@@ -675,6 +1368,16 @@ class QuasarDesktopApp(QMainWindow):
         self.voice_processing = False
         self.voice_stop_event: threading.Event | None = None
         self.voice_worker: VoiceCaptureWorker | None = None
+        self.voice_conversation_active = False
+        self.voice_conversation_listening = False
+        self.voice_conversation_stop_event: threading.Event | None = None
+        self.voice_conversation_worker: VoiceConversationCaptureWorker | None = None
+        self.voice_conversation_retry_attempt = 0
+        self.voice_conversation_retry_timer = QTimer(self)
+        self.voice_conversation_retry_timer.setSingleShot(True)
+        self.voice_conversation_retry_timer.timeout.connect(
+            self._retry_voice_conversation
+        )
         self.speech_worker: LocalSpeechOutputWorker | None = None
         self.signals = AppSignals(self)
         self.signals.response_ready.connect(self._finish_with_response)
@@ -684,8 +1387,15 @@ class QuasarDesktopApp(QMainWindow):
         self.signals.voice_status.connect(self._show_voice_status)
         self.signals.voice_text_ready.connect(self._submit_voice_text)
         self.signals.voice_failed.connect(self._finish_voice_error)
+        self.signals.conversation_voice_text_ready.connect(
+            self._submit_voice_conversation_text
+        )
+        self.signals.conversation_voice_failed.connect(
+            self._finish_voice_conversation_error
+        )
         self.signals.speech_finished.connect(self._finish_speech)
         self.signals.speech_failed.connect(self._finish_speech_error)
+        self.signals.tts_enabled_requested.connect(self._set_tts_enabled)
 
         self.provider = os.getenv("AI_PROVIDER", "ollama").lower()
         self.client: Any = None
@@ -693,6 +1403,13 @@ class QuasarDesktopApp(QMainWindow):
         self.startup_error: str | None = None
         self._create_client(self.provider)
         self.original_run_tool = agent.run_tool
+        self.tts_tool_schema = agent.tool_schema(
+            "set_tts_enabled",
+            "Turn Quasar's spoken responses on or off. Use when the user asks to enable or disable TTS.",
+            {"enabled": {"type": "boolean"}},
+            ["enabled"],
+        )
+        agent.TOOLS.append(self.tts_tool_schema)
         self._configure_agent()
         self._build_ui()
         self._refresh_status()
@@ -877,8 +1594,13 @@ class QuasarDesktopApp(QMainWindow):
 
         hint_row = QHBoxLayout()
         self.voice_response_toggle = QCheckBox("답변 음성")
-        self.voice_response_toggle.setChecked(True)
-        self.voice_response_toggle.setToolTip("답변을 Windows 음성으로 읽습니다.")
+        self.voice_response_toggle.setChecked(
+            self.settings.value("voice/tts_enabled", True, type=bool)
+        )
+        self.voice_response_toggle.setToolTip(
+            "AI 답변 음성을 켜거나 끕니다. 음성 대화에도 적용됩니다."
+        )
+        self.voice_response_toggle.toggled.connect(self._set_tts_enabled)
         hint_row.addWidget(self.voice_response_toggle)
         hint_row.addStretch(1)
         composer_hint = QLabel("Space 길게 누르기: 말하기  ·  Enter: 전송")
@@ -894,6 +1616,9 @@ class QuasarDesktopApp(QMainWindow):
             self.orb_column,
         )
         self.orb.clicked.connect(self.galaxy_transition.toggle)
+        self.galaxy_transition.expanded_changed.connect(
+            self._set_voice_conversation_active
+        )
         self.voice_button.setFocus()
 
     def resizeEvent(self, event: Any) -> None:
@@ -1143,7 +1868,27 @@ class QuasarDesktopApp(QMainWindow):
     def _configure_agent(self) -> None:
         agent.current_directory = Path(__file__).resolve().parent
         agent.auto_approve_commands = True
-        agent.run_tool = self.original_run_tool
+        agent.run_tool = self._run_tool
+
+    def _run_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        live_analysis_server: Any = None,
+        mcp_manager: Any = None,
+    ) -> Any:
+        if name == "set_tts_enabled":
+            enabled = arguments.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError("set_tts_enabled requires a boolean 'enabled' value.")
+            self.signals.tts_enabled_requested.emit(enabled)
+            return f"Quasar spoken responses {'enabled' if enabled else 'disabled'}."
+        return self.original_run_tool(
+            name,
+            arguments,
+            live_analysis_server,
+            mcp_manager,
+        )
 
     def submit(self) -> None:
         if self.busy:
@@ -1218,6 +1963,11 @@ class QuasarDesktopApp(QMainWindow):
     def _start_voice_recording(self) -> None:
         if self.busy or self.voice_recording or self.voice_processing:
             return
+        try:
+            self.voice_recognizer.start_server()
+        except (OSError, RuntimeError) as error:
+            self._finish_voice_error(f"{type(error).__name__}: {error}")
+            return
         self.voice_recording = True
         self.voice_stop_event = threading.Event()
         self.voice_button.setText("듣는 중... 놓으면 전송")
@@ -1245,6 +1995,10 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self.status_label.setText(status)
+        if self.voice_conversation_active:
+            self.galaxy_transition.set_conversation_status(status)
+            if status.startswith("듣는 중... 편하게 말씀하시면 자동으로 전송합니다."):
+                self.voice_conversation_retry_attempt = 0
         if self.voice_processing:
             self.voice_button.setText("음성 인식 중...")
         elif self.voice_recording:
@@ -1259,6 +2013,95 @@ class QuasarDesktopApp(QMainWindow):
         self.composer.setPlainText(text)
         self.submit()
 
+    def _set_voice_conversation_active(self, active: bool) -> None:
+        if self.closing:
+            return
+        self.voice_conversation_active = active
+        if not active:
+            self.voice_conversation_retry_timer.stop()
+            if self.voice_conversation_stop_event is not None:
+                self.voice_conversation_stop_event.set()
+            self.voice_conversation_listening = False
+            return
+        self.voice_conversation_retry_attempt = 0
+        try:
+            self.voice_recognizer.start_server()
+        except (OSError, RuntimeError) as error:
+            self._finish_voice_conversation_error(
+                f"{type(error).__name__}: {error}"
+            )
+            return
+        self.galaxy_transition.set_conversation_status(
+            "듣는 중... 편하게 말씀하시면 자동으로 전송합니다."
+        )
+        self._start_voice_conversation_capture()
+
+    def _start_voice_conversation_capture(self) -> None:
+        if (
+            not self.voice_conversation_active
+            or self.voice_conversation_listening
+            or self.busy
+            or self.closing
+        ):
+            return
+        self.voice_conversation_stop_event = threading.Event()
+        self.voice_conversation_listening = True
+        worker = VoiceConversationCaptureWorker(
+            self.voice_conversation_stop_event,
+            self.voice_recognizer,
+            self.signals,
+            self.microphone_device_index,
+        )
+        self.voice_conversation_worker = worker
+        worker.start()
+
+    def _retry_voice_conversation(self) -> None:
+        if (
+            not self.voice_conversation_active
+            or self.closing
+            or self.busy
+        ):
+            return
+        try:
+            self.voice_recognizer.start_server()
+        except (OSError, RuntimeError) as error:
+            self._finish_voice_conversation_error(
+                f"{type(error).__name__}: {error}"
+            )
+            return
+        self._start_voice_conversation_capture()
+
+    def _submit_voice_conversation_text(self, text: str) -> None:
+        if self.closing or not self.voice_conversation_active:
+            return
+        self.voice_conversation_listening = False
+        self.composer.setPlainText(text)
+        self.submit()
+        if not self.busy:
+            self._start_voice_conversation_capture()
+
+    def _finish_voice_conversation_error(self, error: str) -> None:
+        if self.closing or not self.voice_conversation_active:
+            return
+        self.voice_conversation_listening = False
+        if self.voice_conversation_stop_event is not None:
+            self.voice_conversation_stop_event.set()
+        self.voice_conversation_retry_attempt += 1
+        retry_delay_ms = min(
+            1_000 * 2 ** (self.voice_conversation_retry_attempt - 1),
+            10_000,
+        )
+        retry_delay_seconds = retry_delay_ms // 1_000
+        status = (
+            f"음성 입력 오류: {error} · "
+            f"{retry_delay_seconds}초 후 다시 듣습니다."
+        )
+        self.galaxy_transition.set_conversation_status(
+            status
+        )
+        self.status_label.setText(status)
+        self.voice_conversation_retry_timer.start(retry_delay_ms)
+
     def _finish_voice_error(self, error: str) -> None:
         if self.closing:
             return
@@ -1269,23 +2112,45 @@ class QuasarDesktopApp(QMainWindow):
         self.status_label.setText(f"음성 입력 실패: {error}")
         self.voice_button.setFocus()
 
-    def _speak_response(self, response: str) -> None:
+    def _set_tts_enabled(self, enabled: bool) -> None:
+        if self.voice_response_toggle.isChecked() != enabled:
+            self.voice_response_toggle.setChecked(enabled)
+        self.settings.setValue("voice/tts_enabled", enabled)
+        self.settings.sync()
+        if not enabled and self.speech_worker is not None:
+            self.speech_worker.stop()
+
+    def _speak_response(self, response: str) -> bool:
         spoken_text = re.sub(r"```.*?```", "코드 블록", response, flags=re.DOTALL)
         spoken_text = re.sub(r"[*_#`>]", "", spoken_text).strip()
         if not spoken_text:
-            return
+            return False
         self.status_label.setText("답변을 음성으로 읽고 있습니다...")
+        if self.voice_conversation_active:
+            self.galaxy_transition.set_conversation_status(
+                "답변을 음성으로 들려드리고 있습니다..."
+            )
         worker = LocalSpeechOutputWorker(spoken_text, self.signals)
         self.speech_worker = worker
         worker.start()
+        return True
 
     def _finish_speech(self) -> None:
-        if not self.closing and not self.busy:
+        if self.closing or self.busy:
+            return
+        if self.voice_conversation_active:
+            self._start_voice_conversation_capture()
+        else:
             self.status_label.setText("음성 출력을 마쳤습니다.")
 
     def _finish_speech_error(self, error: str) -> None:
         if not self.closing:
             self.status_label.setText(f"음성 출력 실패: {error}")
+            if self.voice_conversation_active:
+                self.galaxy_transition.set_conversation_status(
+                    f"음성 출력 실패: {error} 다시 말씀해 주세요."
+                )
+                self._start_voice_conversation_capture()
 
     def _show_request_progress(self, progress: str) -> None:
         if self.closing:
@@ -1305,7 +2170,10 @@ class QuasarDesktopApp(QMainWindow):
         self._add_message("assistant", response)
         self._set_busy(False)
         if self.voice_response_toggle.isChecked():
-            self._speak_response(response)
+            if not self._speak_response(response) and self.voice_conversation_active:
+                self._start_voice_conversation_capture()
+        elif self.voice_conversation_active:
+            self._start_voice_conversation_capture()
 
     def _finish_with_error(self, error: str) -> None:
         if self.closing:
@@ -1313,6 +2181,8 @@ class QuasarDesktopApp(QMainWindow):
         self.activity_body = None
         self._add_message("assistant", f"요청 처리 실패: {error}")
         self._set_busy(False)
+        if self.voice_conversation_active:
+            self._start_voice_conversation_capture()
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -1325,6 +2195,12 @@ class QuasarDesktopApp(QMainWindow):
         self.orb.set_active(busy)
         if busy:
             self.status_label.setText("응답을 생성하는 중...")
+            if self.voice_conversation_active:
+                self.galaxy_transition.set_conversation_status(
+                    "응답을 생성하고 있습니다..."
+                )
+        elif self.voice_conversation_active:
+            self.status_label.setText("은하 음성 대화 중...")
         else:
             self._refresh_status()
             self.voice_button.setFocus()
@@ -1399,9 +2275,18 @@ class QuasarDesktopApp(QMainWindow):
                 event.ignore()
                 return
         self.closing = True
+        self.voice_conversation_active = False
+        if self.voice_conversation_stop_event is not None:
+            self.voice_conversation_stop_event.set()
+        self.voice_conversation_retry_timer.stop()
         if self.voice_stop_event is not None:
             self.voice_stop_event.set()
+        if self.speech_worker is not None:
+            self.speech_worker.stop()
+        self.voice_recognizer.close()
         agent.run_tool = self.original_run_tool
+        if self.tts_tool_schema in agent.TOOLS:
+            agent.TOOLS.remove(self.tts_tool_schema)
         event.accept()
 
 
