@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QFileDialog,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -75,6 +77,15 @@ VOICE_RECOGNITION_SAMPLE_RATE = 16_000
 VOICE_INPUT_MAX_GAIN = 2.0
 VOICE_INPUT_TARGET_PEAK = 0.35
 VOICE_CONVERSATION_END_SILENCE_SECONDS = 0.6
+
+
+class _OfficeDocumentSource:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+
+    def latest_document(self) -> None:
+        return None
+
 
 class AppSignals(QObject):
     response_ready = Signal(str, object)
@@ -1362,6 +1373,9 @@ class QuasarDesktopApp(QMainWindow):
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         self.settings = QSettings("Quasar", "Quasar")
+        self.office_monitor: agent.CliCollaborationMonitor | None = None
+        self.office_monitor_client: Any = None
+        self.office_monitor_source: _OfficeDocumentSource | None = None
         self.microphone_notice: str | None = None
         self.microphone_device_index = self._restore_microphone_selection()
         self.busy = False
@@ -1486,6 +1500,13 @@ class QuasarDesktopApp(QMainWindow):
         self.settings_button.setMinimumHeight(40)
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.settings_button)
+        self.office_watch_button = QPushButton("Word/PPT 감시")
+        self.office_watch_button.setMinimumHeight(40)
+        self.office_watch_button.clicked.connect(self._open_office_watch_dialog)
+        self.office_watch_button.setToolTip(
+            "저장된 Word/PPT 파일을 등록하고 공동작업 감시를 설정합니다."
+        )
+        header.addWidget(self.office_watch_button)
         layout.addWidget(top_bar)
 
         self.status_label = QLabel()
@@ -1638,6 +1659,10 @@ class QuasarDesktopApp(QMainWindow):
         self.voice_interrupt_shortcut.activated.connect(
             self._interrupt_voice_conversation
         )
+        self.office_monitor_timer = QTimer(self)
+        self.office_monitor_timer.setInterval(500)
+        self.office_monitor_timer.timeout.connect(self._poll_office_monitor)
+        self.office_monitor_timer.start()
         self.voice_button.setFocus()
 
     def resizeEvent(self, event: Any) -> None:
@@ -1661,6 +1686,7 @@ class QuasarDesktopApp(QMainWindow):
     def _change_provider(self, provider: str) -> None:
         if self.busy or provider == self.provider:
             return
+        office_monitor_was_enabled = self._reset_office_monitor()
         self._create_client(provider)
         self.model_selector.blockSignals(True)
         self.model_selector.clear()
@@ -1668,12 +1694,20 @@ class QuasarDesktopApp(QMainWindow):
         self.model_selector.blockSignals(False)
         self.refresh_models_button.setEnabled(self.client is not None)
         self._refresh_status()
+        if office_monitor_was_enabled:
+            self.status_label.setText(
+                "AI 공급자가 변경되어 Word/PPT 감시를 중지했습니다. 다시 켜 주세요."
+            )
         if self.client is not None:
             self._load_model_options()
 
     def _remember_model(self, model: str) -> None:
         model = model.strip()
         if model:
+            if model != self.model and self._reset_office_monitor():
+                self.status_label.setText(
+                    "AI 모델이 변경되어 Word/PPT 감시를 중지했습니다. 다시 켜 주세요."
+                )
             self.model = model
 
     def _restore_microphone_selection(self) -> int | None:
@@ -1883,6 +1917,227 @@ class QuasarDesktopApp(QMainWindow):
         if self.microphone_notice:
             status = f"{status} · {self.microphone_notice}"
         self.status_label.setText(status)
+
+    def _ensure_office_monitor(self) -> agent.CliCollaborationMonitor:
+        if self.office_monitor is not None:
+            return self.office_monitor
+        model = self.model_selector.currentText().strip() or self.model
+        if not model:
+            raise ValueError("Office 감시를 시작하기 전에 AI 모델을 선택해 주세요.")
+        client, selected_model = agent.create_client(self.provider, model)
+        workspace = Path(__file__).resolve().parent
+        source = _OfficeDocumentSource(workspace)
+        settings = agent.load_collaboration_settings(
+            workspace / "collaboration_config.json"
+        )
+        try:
+            monitor = agent.CliCollaborationMonitor(
+                client,
+                selected_model,
+                source,
+                settings,
+                allow_external_office_files=True,
+            )
+        except Exception:
+            client.close()
+            raise
+        self.office_monitor_client = client
+        self.office_monitor_source = source
+        self.office_monitor = monitor
+        return monitor
+
+    def _dispose_office_monitor(self) -> None:
+        monitor = self.office_monitor
+        client = self.office_monitor_client
+        self.office_monitor = None
+        self.office_monitor_client = None
+        self.office_monitor_source = None
+        if monitor is not None:
+            try:
+                monitor.set_enabled(False)
+                monitor.close()
+            except Exception as error:
+                print(
+                    f"Office 감시 종료 실패: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if client is not None:
+            try:
+                client.close()
+            except Exception as error:
+                print(
+                    f"Office 감시 연결 종료 실패: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def _reset_office_monitor(self) -> bool:
+        monitor = self.office_monitor
+        if monitor is None:
+            return False
+        was_enabled = monitor.is_enabled()
+        self._dispose_office_monitor()
+        return was_enabled
+
+    def _open_office_watch_dialog(self) -> None:
+        try:
+            monitor = self._ensure_office_monitor()
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                "Office 감시 준비 실패",
+                f"{type(error).__name__}: {error}",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Word/PPT 공동작업 감시")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        description = QLabel(
+            "등록한 Word/PPT 파일은 저장 후 검토합니다. 문서 내용이 선택된 AI 제공자에 "
+            "전송될 수 있으며, 문서는 수정 제안을 승인할 때만 변경됩니다."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        file_list = QListWidget()
+        file_list.addItems(monitor.list_office_documents())
+        layout.addWidget(file_list)
+
+        controls = QHBoxLayout()
+        add_button = QPushButton("파일 추가")
+        remove_button = QPushButton("선택 제거")
+        controls.addWidget(add_button)
+        controls.addWidget(remove_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        enabled_checkbox = QCheckBox("공동작업 감시 켜기")
+        enabled_checkbox.setChecked(monitor.is_enabled())
+        layout.addWidget(enabled_checkbox)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box.rejected.connect(dialog.reject)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+
+        def add_office_file() -> None:
+            file_path, _selected_filter = QFileDialog.getOpenFileName(
+                dialog,
+                "감시할 Word 또는 PowerPoint 파일 선택",
+                str(Path.home()),
+                "Office 문서 (*.docx *.pptx)",
+            )
+            if not file_path:
+                return
+            result = monitor.add_office_document(file_path)
+            if "추가했습니다:" not in result:
+                QMessageBox.warning(dialog, "파일 등록 실패", result)
+            file_list.clear()
+            file_list.addItems(monitor.list_office_documents())
+
+        def remove_office_file() -> None:
+            selected = file_list.currentItem()
+            if selected is None:
+                QMessageBox.information(dialog, "파일 선택", "목록에서 파일을 선택해 주세요.")
+                return
+            result = monitor.remove_office_document(selected.text())
+            if "제거했습니다:" not in result:
+                QMessageBox.warning(dialog, "파일 제거 실패", result)
+            file_list.clear()
+            file_list.addItems(monitor.list_office_documents())
+
+        add_button.clicked.connect(add_office_file)
+        remove_button.clicked.connect(remove_office_file)
+        enabled_checkbox.toggled.connect(
+            lambda enabled: self._set_office_monitor_enabled(
+                enabled,
+                enabled_checkbox,
+            )
+        )
+        dialog.exec()
+
+    def _set_office_monitor_enabled(
+        self,
+        enabled: bool,
+        checkbox: QCheckBox | None = None,
+    ) -> None:
+        if self.closing:
+            return
+        if enabled:
+            try:
+                monitor = self._ensure_office_monitor()
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Office 감시 시작 실패",
+                    f"{type(error).__name__}: {error}",
+                )
+                if checkbox is not None:
+                    was_blocked = checkbox.blockSignals(True)
+                    try:
+                        checkbox.setChecked(False)
+                    finally:
+                        checkbox.blockSignals(was_blocked)
+                return
+            monitor.set_enabled(True)
+            self.status_label.setText(
+                f"Word/PPT 감시 중 · {len(monitor.list_office_documents())}개 파일"
+            )
+            return
+        if self.office_monitor is not None:
+            self.office_monitor.set_enabled(False)
+            self.status_label.setText("Word/PPT 감시를 껐습니다.")
+
+    def _poll_office_monitor(self) -> None:
+        monitor = self.office_monitor
+        if self.closing or monitor is None:
+            return
+        for question in monitor.take_pending_questions():
+            self._add_message("assistant", question)
+        for proposal_id, proposal in monitor.take_pending_office_proposals():
+            self._show_office_proposal(proposal_id, proposal)
+
+    def _show_office_proposal(
+        self,
+        proposal_id: int,
+        proposal: dict[str, str],
+    ) -> None:
+        monitor = self.office_monitor
+        if monitor is None:
+            return
+        content = (
+            f"**Office 수정 제안 {proposal_id}** · `{Path(proposal['path']).name}`\n\n"
+            f"이유: {proposal['reason']}\n\n"
+            f"기존 문단:\n> {proposal['before']}\n\n"
+            f"수정 제안:\n> {proposal['replacement']}"
+        )
+        bubble, _body = self._add_message("assistant", content)
+        buttons = QHBoxLayout()
+        approve_button = QPushButton("승인하고 적용")
+        reject_button = QPushButton("거절")
+        buttons.addWidget(approve_button)
+        buttons.addWidget(reject_button)
+        buttons.addStretch(1)
+        bubble.layout().addLayout(buttons)
+
+        def finish_proposal(approved: bool) -> None:
+            active_monitor = self.office_monitor
+            if active_monitor is None:
+                return
+            result = (
+                active_monitor.approve_office_proposal(proposal_id)
+                if approved
+                else active_monitor.reject_office_proposal(proposal_id)
+            )
+            approve_button.setEnabled(False)
+            reject_button.setEnabled(False)
+            self._add_message("assistant", result)
+
+        approve_button.clicked.connect(lambda: finish_proposal(True))
+        reject_button.clicked.connect(lambda: finish_proposal(False))
 
     def _configure_agent(self) -> None:
         agent.current_directory = Path(__file__).resolve().parent
@@ -2444,6 +2699,8 @@ class QuasarDesktopApp(QMainWindow):
                 event.ignore()
                 return
         self.closing = True
+        self.office_monitor_timer.stop()
+        self._dispose_office_monitor()
         if self.request_cancel_event is not None:
             self.request_cancel_event.set()
         if self.request_client is not None:

@@ -894,10 +894,12 @@ class CliCollaborationMonitor:
         model: str,
         live_analysis_server: CliLiveAnalysisServer,
         settings: dict[str, int],
+        allow_external_office_files: bool = False,
     ):
         self.client = client
         self.model = model
         self.live_analysis_server = live_analysis_server
+        self.allow_external_office_files = allow_external_office_files
         self.poll_interval = settings["poll_interval_seconds"]
         self.stable_seconds = settings["stable_seconds"]
         self.idle_seconds = settings["idle_seconds"]
@@ -914,6 +916,7 @@ class CliCollaborationMonitor:
         self._office_attempted_signatures: dict[str, tuple[int, int]] = {}
         self._office_attempted_versions: dict[str, str] = {}
         self._office_proposals: dict[int, dict[str, str]] = {}
+        self._pending_office_notifications: list[tuple[int, dict[str, str]]] = []
         self._next_office_proposal_id = 1
         self._thread = threading.Thread(
             target=self._run,
@@ -929,10 +932,14 @@ class CliCollaborationMonitor:
         if candidate.is_symlink():
             raise ValueError("심볼릭 링크는 감시할 수 없습니다.")
         try:
-            target = candidate.resolve(strict=require_file)
-            target.relative_to(self.live_analysis_server.workspace)
+            target = candidate.resolve()
         except (OSError, ValueError) as error:
-            raise ValueError("감시 파일은 작업 폴더 안에 있어야 합니다.") from error
+            raise ValueError(f"Office 파일 경로를 확인할 수 없습니다: {error}") from error
+        if not self.allow_external_office_files:
+            try:
+                target.relative_to(self.live_analysis_server.workspace)
+            except ValueError as error:
+                raise ValueError("감시 파일은 작업 폴더 안에 있어야 합니다.") from error
         if target.suffix.lower() not in SUPPORTED_OFFICE_SUFFIXES:
             raise ValueError("감시할 수 있는 형식은 .docx와 .pptx입니다.")
         if require_file and not target.is_file():
@@ -1017,6 +1024,12 @@ class CliCollaborationMonitor:
     def list_office_documents(self) -> list[str]:
         with self._lock:
             return self._office_paths[:]
+
+    def take_pending_office_proposals(self) -> list[tuple[int, dict[str, str]]]:
+        with self._lock:
+            proposals = self._pending_office_notifications[:]
+            self._pending_office_notifications.clear()
+            return proposals
 
     def reject_office_proposal(self, proposal_id: int) -> str:
         with self._lock:
@@ -1259,6 +1272,9 @@ class CliCollaborationMonitor:
                         "replacement": replacement,
                         "reason": reason,
                     }
+                    self._pending_office_notifications.append(
+                        (proposal_id, self._office_proposals[proposal_id].copy())
+                    )
                     print(
                         f"\n[Office 수정 제안 {proposal_id}] {path.name} ({target})\n"
                         f"이유: {reason}\n"
