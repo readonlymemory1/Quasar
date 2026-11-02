@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from functools import lru_cache
 from typing import Any
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
@@ -70,6 +71,16 @@ def _rgba(rgb: tuple, alpha: float) -> QColor:
     return QColor(int(rgb[0]), int(rgb[1]), int(rgb[2]), int(_clamp(alpha, 0, 255)))
 
 
+@lru_cache(maxsize=2048)
+def _particle_pen(rgb: tuple, alpha: int, width: float) -> QPen:
+    return QPen(
+        _rgba(rgb, alpha),
+        width,
+        Qt.PenStyle.SolidLine,
+        Qt.PenCapStyle.RoundCap,
+    )
+
+
 class OrbWidget(QWidget):
     clicked = Signal()
 
@@ -116,6 +127,13 @@ class OrbWidget(QWidget):
             (rng.random(), rng.random(), rng.uniform(0.5, 1.0), rng.uniform(0, math.tau))
             for _ in range(10)
         ]
+        self._particle_tail_offsets = [
+            (math.cos(omega * 0.14), math.sin(omega * 0.14))
+            for _, _, omega, _, _, _ in self.particles
+        ]
+        self._cached_card_size: tuple[int, int] | None = None
+        self._cached_card_path: QPainterPath | None = None
+        self._cached_sky_brush: QBrush | None = None
 
         self.timer = QTimer(self)
         self.timer.setInterval(24)
@@ -184,6 +202,7 @@ class OrbWidget(QWidget):
     # -------------------------------------------------------------- drawing
     def paintEvent(self, _event: Any) -> None:
         w, h = self.width(), self.height()
+        self._ensure_static_paint_resources(w, h)
         cx, cy = w / 2, h / 2
         s = min(w / 144.0, h / 210.0)
         hole = self.HOLE * s * (1 + 0.1 * self.pull)
@@ -194,15 +213,9 @@ class OrbWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # 우주 배경 카드 (밝은 패널 위에서도 빛이 살아나도록)
-        card = QPainterPath()
-        card.addRoundedRect(QRectF(0, 0, w, h), 18, 18)
-        painter.setClipPath(card)
+        painter.setClipPath(self._cached_card_path)
         if not self.transparent_card:
-            sky = QLinearGradient(0, 0, 0, h)
-            sky.setColorAt(0.0, QColor(9, 12, 28))
-            sky.setColorAt(0.5, QColor(4, 6, 15))
-            sky.setColorAt(1.0, QColor(10, 9, 27))
-            painter.fillRect(self.rect(), QBrush(sky))
+            painter.fillRect(self.rect(), self._cached_sky_brush)
 
         painter.setPen(Qt.PenStyle.NoPen)
         for fx, fy, size, phase in self.stars:
@@ -235,6 +248,19 @@ class OrbWidget(QWidget):
         self._draw_batch(painter, front)
         painter.end()
 
+    def _ensure_static_paint_resources(self, width: int, height: int) -> None:
+        size = (width, height)
+        if self._cached_card_size == size:
+            return
+        card = QPainterPath()
+        card.addRoundedRect(QRectF(0, 0, width, height), 18, 18)
+        sky = QLinearGradient(0, 0, 0, height)
+        sky.setColorAt(0.0, QColor(9, 12, 28))
+        sky.setColorAt(0.5, QColor(4, 6, 15))
+        sky.setColorAt(1.0, QColor(10, 9, 27))
+        self._cached_card_size = size
+        self._cached_card_path = card
+        self._cached_sky_brush = QBrush(sky)
 
     def _build_disk(self, cx: float, cy: float, s: float, energy: float):
         back: list[tuple] = []
@@ -243,15 +269,16 @@ class OrbWidget(QWidget):
         tilt = self.TILT
         spin = self.spin
 
-        for radius, a0, omega, size, bright, rgb in self.particles[:self.particle_count]:
+        for index in range(self.particle_count):
+            radius, a0, omega, size, bright, rgb = self.particles[index]
+            tail_cos, tail_sin = self._particle_tail_offsets[index]
             r = radius * squeeze * s
             a = a0 + omega * spin
             ca, sa = math.cos(a), math.sin(a)
-            a_tail = a - omega * 0.14  # 꼬리: 안쪽일수록 길게 → 흐르는 느낌
             alpha = 175 * bright * energy * (1 + 0.6 * ca)  # 도플러 빔: 다가오는 쪽이 더 밝음
             item = (
-                cx + math.cos(a_tail) * r,
-                cy + math.sin(a_tail) * r * tilt,
+                cx + (ca * tail_cos + sa * tail_sin) * r,
+                cy + (sa * tail_cos - ca * tail_sin) * r * tilt,
                 cx + ca * r,
                 cy + sa * r * tilt,
                 rgb,
@@ -265,14 +292,7 @@ class OrbWidget(QWidget):
     @staticmethod
     def _draw_batch(painter: QPainter, batch: list[tuple]) -> None:
         for x1, y1, x2, y2, rgb, alpha, width in batch:
-            painter.setPen(
-                QPen(
-                    _rgba(rgb, alpha),
-                    width,
-                    Qt.PenStyle.SolidLine,
-                    Qt.PenCapStyle.RoundCap,
-                )
-            )
+            painter.setPen(_particle_pen(rgb, int(_clamp(alpha, 0, 255)), width))
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
     def _draw_glow(
@@ -559,6 +579,7 @@ class GalaxyTransitionOverlay(QWidget):
             max(1, self.width() - 64),
             54,
         )
+        self.orbit_layer.setGeometry(self.rect())
         super().resizeEvent(event)
 
     def toggle(self) -> None:
@@ -602,6 +623,12 @@ class GalaxyTransitionOverlay(QWidget):
 
     def _advance(self) -> None:
         self.clock += self.timer.interval() / 1000
+        if self._animation_complete:
+            if self._animation_target > 0.5:
+                self.update()
+                self.orbit_layer.update()
+            return
+
         elapsed = (time.perf_counter() - self._animation_started) / self._duration
         amount = _smoothstep(elapsed)
         self.progress = _mix(
@@ -618,7 +645,6 @@ class GalaxyTransitionOverlay(QWidget):
         )
         self.orb.particle_size_scale = 1.0
 
-        self.setGeometry(self.parentWidget().rect())
         target_scale = min(
             380 / 144.0,
             (self.width() - 80) / 144.0,
@@ -656,10 +682,6 @@ class GalaxyTransitionOverlay(QWidget):
                 210 * scale,
             ).toRect()
         )
-        self.orbit_layer.setGeometry(self.rect())
-        self.orb.raise_()
-        self.orbit_layer.raise_()
-        self.conversation_status.raise_()
         self.update()
         self.orbit_layer.update()
 
@@ -794,7 +816,6 @@ class BlackHoleOverlay(QWidget):
         if not self.glyphs:
             return
         progress = _clamp(self.progress)
-        end_x, end_y = self.end_point
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)

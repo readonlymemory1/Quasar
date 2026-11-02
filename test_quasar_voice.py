@@ -588,14 +588,15 @@ class VoiceWorkerTests(unittest.TestCase):
                 self.checked = checked
 
         settings = Mock()
-        speech_worker = Mock()
+        stop_speech = Mock()
         toggle = FakeToggle()
 
         Quasar.QuasarDesktopApp._set_tts_enabled(
             types.SimpleNamespace(
                 voice_response_toggle=toggle,
                 settings=settings,
-                speech_worker=speech_worker,
+                speech_worker=object(),
+                _stop_speech=stop_speech,
             ),
             False,
         )
@@ -603,7 +604,93 @@ class VoiceWorkerTests(unittest.TestCase):
         self.assertFalse(toggle.checked)
         settings.setValue.assert_called_once_with("voice/tts_enabled", False)
         settings.sync.assert_called_once_with()
+        stop_speech.assert_called_once_with()
+
+    def test_request_stop_sets_cancel_event_and_closes_request_client(self) -> None:
+        cancel_event = threading.Event()
+        request_client = Mock()
+        app = types.SimpleNamespace(
+            busy=True,
+            request_cancel_event=cancel_event,
+            request_cancel_pending=False,
+            request_client=request_client,
+            send_button=Mock(),
+            status_label=Mock(),
+            activity_body=types.SimpleNamespace(setText=Mock()),
+        )
+
+        Quasar.QuasarDesktopApp._cancel_request(app)
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertTrue(app.request_cancel_pending)
+        request_client.close.assert_called_once_with()
+        app.send_button.setText.assert_called_once_with("중지 중...")
+
+    def test_request_cancellation_does_not_add_a_late_answer_to_history(self) -> None:
+        cancel_event = threading.Event()
+        client = Mock()
+
+        def finish_request(**_kwargs: object) -> types.SimpleNamespace:
+            cancel_event.set()
+            return types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        message=types.SimpleNamespace(
+                            tool_calls=None,
+                            content="Late answer",
+                        )
+                    )
+                ]
+            )
+
+        client.chat.completions.create.side_effect = finish_request
+        messages: list[dict[str, str]] = []
+
+        with self.assertRaises(InterruptedError):
+            Quasar.agent.request_agent(
+                client,
+                "gpt-4o",
+                messages,
+                "test request",
+                cancel_event=cancel_event,
+            )
+
+        self.assertEqual(messages, [])
+
+    def test_stopping_speech_in_voice_conversation_starts_listening(self) -> None:
+        speech_worker = Mock()
+        start_capture = Mock()
+        app = types.SimpleNamespace(
+            speech_worker=speech_worker,
+            busy=False,
+            voice_conversation_active=True,
+            send_button=Mock(),
+            status_label=Mock(),
+            galaxy_transition=types.SimpleNamespace(
+                set_conversation_status=Mock()
+            ),
+            _start_voice_conversation_capture=start_capture,
+        )
+
+        Quasar.QuasarDesktopApp._stop_speech(app)
+
+        self.assertIsNone(app.speech_worker)
         speech_worker.stop.assert_called_once_with()
+        start_capture.assert_called_once_with()
+        app.send_button.setText.assert_called_once_with("전송")
+
+    def test_ctrl_space_interrupts_tts_in_voice_conversation(self) -> None:
+        stop_speech = Mock()
+        app = types.SimpleNamespace(
+            closing=False,
+            voice_conversation_active=True,
+            speech_worker=object(),
+            _stop_speech=stop_speech,
+        )
+
+        Quasar.QuasarDesktopApp._interrupt_voice_conversation(app)
+
+        stop_speech.assert_called_once_with()
 
     def test_voice_conversation_skips_tts_when_disabled(self) -> None:
         class FakeToggle:
@@ -613,15 +700,21 @@ class VoiceWorkerTests(unittest.TestCase):
         app = types.SimpleNamespace(
             closing=False,
             activity_body=object(),
+            messages=[{"role": "system", "content": "system"}],
             voice_response_toggle=FakeToggle(),
             voice_conversation_active=True,
+            _clear_request_state=Mock(),
             _add_message=Mock(),
             _set_busy=Mock(),
             _speak_response=Mock(return_value=True),
             _start_voice_conversation_capture=Mock(),
         )
 
-        Quasar.QuasarDesktopApp._finish_with_response(app, "답변입니다.")
+        Quasar.QuasarDesktopApp._finish_with_response(
+            app,
+            "답변입니다.",
+            [{"role": "system", "content": "system"}],
+        )
 
         app._speak_response.assert_not_called()
         app._start_voice_conversation_capture.assert_called_once_with()
@@ -632,8 +725,8 @@ class VoiceWorkerTests(unittest.TestCase):
         errors: list[str] = []
         playback: dict[str, object] = {}
         signals = Quasar.AppSignals()
-        signals.speech_finished.connect(lambda: completed.append(True))
-        signals.speech_failed.connect(errors.append)
+        signals.speech_finished.connect(lambda _worker: completed.append(True))
+        signals.speech_failed.connect(lambda _worker, error: errors.append(error))
 
         def fake_run(command: list[str], **_kwargs: object) -> types.SimpleNamespace:
             text_path = Path(command[command.index("--file") + 1])

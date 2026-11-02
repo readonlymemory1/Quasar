@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 
 import quasar_cli as agent
 from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut
 from quasar_galaxy import (
     CANVAS_BACKGROUND_STOPS,
     BlackHoleOverlay,
@@ -77,7 +77,8 @@ VOICE_INPUT_TARGET_PEAK = 0.35
 VOICE_CONVERSATION_END_SILENCE_SECONDS = 0.6
 
 class AppSignals(QObject):
-    response_ready = Signal(str)
+    response_ready = Signal(str, object)
+    request_cancelled = Signal()
     request_failed = Signal(str)
     request_progress = Signal(str)
     models_loaded = Signal(str, object, object)
@@ -86,8 +87,8 @@ class AppSignals(QObject):
     voice_failed = Signal(str)
     conversation_voice_text_ready = Signal(str)
     conversation_voice_failed = Signal(str)
-    speech_finished = Signal()
-    speech_failed = Signal(str)
+    speech_finished = Signal(object)
+    speech_failed = Signal(object, str)
     tts_enabled_requested = Signal(bool)
     audio_test_ready = Signal(object)
     audio_test_failed = Signal(str)
@@ -1185,9 +1186,12 @@ class LocalSpeechOutputWorker(threading.Thread):
                     if self.stop_event.is_set():
                         sd.stop()
         except Exception as error:
-            self.signals.speech_failed.emit(f"{type(error).__name__}: {error}")
+            self.signals.speech_failed.emit(
+                self,
+                f"{type(error).__name__}: {error}",
+            )
             return
-        self.signals.speech_finished.emit()
+        self.signals.speech_finished.emit(self)
 
 
 class ModelLoader(threading.Thread):
@@ -1362,6 +1366,9 @@ class QuasarDesktopApp(QMainWindow):
         self.microphone_device_index = self._restore_microphone_selection()
         self.busy = False
         self.closing = False
+        self.request_cancel_pending = False
+        self.request_cancel_event: threading.Event | None = None
+        self.request_client: Any = None
         self.activity_body: QLabel | None = None
         self.voice_recognizer = LocalSpeechRecognizer()
         self.voice_recording = False
@@ -1381,6 +1388,7 @@ class QuasarDesktopApp(QMainWindow):
         self.speech_worker: LocalSpeechOutputWorker | None = None
         self.signals = AppSignals(self)
         self.signals.response_ready.connect(self._finish_with_response)
+        self.signals.request_cancelled.connect(self._finish_cancelled_request)
         self.signals.request_failed.connect(self._finish_with_error)
         self.signals.request_progress.connect(self._show_request_progress)
         self.signals.models_loaded.connect(self._apply_model_options)
@@ -1578,7 +1586,7 @@ class QuasarDesktopApp(QMainWindow):
         self.send_button = QPushButton("전송")
         self.send_button.setObjectName("sendButton")
         self.send_button.setFixedSize(96, 44)
-        self.send_button.clicked.connect(self.submit)
+        self.send_button.clicked.connect(self._handle_send_button)
         composer_layout.addWidget(self.send_button)
         composer_row.addWidget(composer_panel, 1)
 
@@ -1603,10 +1611,10 @@ class QuasarDesktopApp(QMainWindow):
         self.voice_response_toggle.toggled.connect(self._set_tts_enabled)
         hint_row.addWidget(self.voice_response_toggle)
         hint_row.addStretch(1)
-        composer_hint = QLabel("Space 길게 누르기: 말하기  ·  Enter: 전송")
-        composer_hint.setAlignment(Qt.AlignmentFlag.AlignRight)
-        composer_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px; padding-right: 4px;")
-        hint_row.addWidget(composer_hint)
+        self.composer_hint = QLabel("Space 길게 누르기: 말하기  ·  Enter: 전송")
+        self.composer_hint.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.composer_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px; padding-right: 4px;")
+        hint_row.addWidget(self.composer_hint)
         layout.addLayout(hint_row)
         self.black_hole_overlay = BlackHoleOverlay(central)
         self.black_hole_overlay.setGeometry(central.rect())
@@ -1618,6 +1626,17 @@ class QuasarDesktopApp(QMainWindow):
         self.orb.clicked.connect(self.galaxy_transition.toggle)
         self.galaxy_transition.expanded_changed.connect(
             self._set_voice_conversation_active
+        )
+        self.voice_interrupt_shortcut = QShortcut(
+            QKeySequence("Ctrl+Space"),
+            self,
+        )
+        self.voice_interrupt_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.voice_interrupt_shortcut.setEnabled(False)
+        self.voice_interrupt_shortcut.activated.connect(
+            self._interrupt_voice_conversation
         )
         self.voice_button.setFocus()
 
@@ -1893,6 +1912,8 @@ class QuasarDesktopApp(QMainWindow):
     def submit(self) -> None:
         if self.busy:
             return
+        if self.speech_worker is not None:
+            self._stop_speech()
         selected_model = self.model_selector.currentText().strip()
         if selected_model:
             self.model = selected_model
@@ -1909,6 +1930,17 @@ class QuasarDesktopApp(QMainWindow):
         if not self.model:
             self._add_message("assistant", "사용할 모델을 선택하거나 모델 이름을 입력해 주세요.")
             return
+        try:
+            request_client, request_model = agent.create_client(
+                self.provider,
+                self.model,
+            )
+        except Exception as error:
+            self._add_message(
+                "assistant",
+                f"요청 연결을 준비하지 못했습니다: {type(error).__name__}: {error}",
+            )
+            return
 
         source_point = self.composer.mapTo(
             self.centralWidget(), self.composer.rect().center()
@@ -1923,42 +1955,109 @@ class QuasarDesktopApp(QMainWindow):
         )
         self.orb.start_submission()
         self.composer.clear()
-        self.messages.append({"role": "user", "content": prompt})
         self._add_message("user", prompt)
         _activity_bubble, self.activity_body = self._add_message(
             "assistant",
             "요청을 분석하고 있습니다...",
             streaming=True,
         )
+        request_messages = list(self.messages)
+        cancel_event = threading.Event()
+        self.request_cancel_event = cancel_event
+        self.request_client = request_client
+        self.request_cancel_pending = False
         self.busy = True
         self._set_busy(True)
-        client = self.client
-        model = self.model
+        model = request_model
         worker = threading.Thread(
             target=self._request_response,
-            args=(client, model, prompt),
+            args=(request_client, model, prompt, request_messages, cancel_event),
             daemon=True,
         )
         self.worker_thread = worker
         worker.start()
 
-    def _request_response(self, client: Any, model: str, prompt: str) -> None:
+    def _request_response(
+        self,
+        client: Any,
+        model: str,
+        prompt: str,
+        messages: list[dict[str, Any]],
+        cancel_event: threading.Event,
+    ) -> None:
         try:
-            response = agent.request_agent(
-                client,
-                model,
-                self.messages,
-                prompt,
-                live_analysis_server=None,
-                mcp_manager=None,
-                progress_callback=self.signals.request_progress.emit,
-            )
-        except Exception as error:
-            self.signals.request_failed.emit(
-                f"{type(error).__name__}: {error}"
-            )
+            try:
+                response = agent.request_agent(
+                    client,
+                    model,
+                    messages,
+                    prompt,
+                    live_analysis_server=None,
+                    mcp_manager=None,
+                    progress_callback=self.signals.request_progress.emit,
+                    cancel_event=cancel_event,
+                )
+            except InterruptedError:
+                self.signals.request_cancelled.emit()
+                return
+            except Exception as error:
+                if cancel_event.is_set():
+                    self.signals.request_cancelled.emit()
+                    return
+                self.signals.request_failed.emit(
+                    f"{type(error).__name__}: {error}"
+                )
+                return
+            if cancel_event.is_set():
+                self.signals.request_cancelled.emit()
+                return
+            self.signals.response_ready.emit(response, messages)
+        finally:
+            try:
+                client.close()
+            except Exception as error:
+                print(
+                    f"요청 연결 종료 실패: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def _handle_send_button(self) -> None:
+        if self.busy:
+            self._cancel_request()
+        elif self.speech_worker is not None:
+            self._stop_speech()
+        else:
+            self.submit()
+
+    def _cancel_request(self) -> None:
+        if (
+            not self.busy
+            or self.request_cancel_event is None
+            or self.request_cancel_pending
+        ):
             return
-        self.signals.response_ready.emit(response)
+        self.request_cancel_pending = True
+        self.request_cancel_event.set()
+        self.send_button.setText("중지 중...")
+        self.send_button.setEnabled(False)
+        self.status_label.setText(
+            "응답 중지를 요청했습니다. 실행 중인 도구는 완료될 수 있습니다."
+        )
+        if self.activity_body is not None:
+            self.activity_body.setText("응답을 중지하고 있습니다...")
+        if self.request_client is not None:
+            try:
+                self.request_client.close()
+            except Exception as error:
+                self.status_label.setText(
+                    f"요청 연결 중지 실패: {type(error).__name__}: {error}"
+                )
+
+    def _clear_request_state(self) -> None:
+        self.request_cancel_event = None
+        self.request_client = None
+        self.request_cancel_pending = False
 
     def _start_voice_recording(self) -> None:
         if self.busy or self.voice_recording or self.voice_processing:
@@ -2017,6 +2116,12 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self.voice_conversation_active = active
+        self.voice_interrupt_shortcut.setEnabled(active)
+        self.composer_hint.setText(
+            "Ctrl+Space: 답변 음성 중지 후 말하기"
+            if active
+            else "Space 길게 누르기: 말하기  ·  Enter: 전송"
+        )
         if not active:
             self.voice_conversation_retry_timer.stop()
             if self.voice_conversation_stop_event is not None:
@@ -2035,6 +2140,18 @@ class QuasarDesktopApp(QMainWindow):
             "듣는 중... 편하게 말씀하시면 자동으로 전송합니다."
         )
         self._start_voice_conversation_capture()
+
+    def _interrupt_voice_conversation(self) -> None:
+        if self.closing or not self.voice_conversation_active:
+            return
+        if self.speech_worker is not None:
+            self._stop_speech()
+            return
+        if self.busy:
+            self._cancel_request()
+            return
+        if not self.voice_conversation_listening:
+            self._start_voice_conversation_capture()
 
     def _start_voice_conversation_capture(self) -> None:
         if (
@@ -2118,7 +2235,7 @@ class QuasarDesktopApp(QMainWindow):
         self.settings.setValue("voice/tts_enabled", enabled)
         self.settings.sync()
         if not enabled and self.speech_worker is not None:
-            self.speech_worker.stop()
+            self._stop_speech()
 
     def _speak_response(self, response: str) -> bool:
         spoken_text = re.sub(r"```.*?```", "코드 블록", response, flags=re.DOTALL)
@@ -2132,18 +2249,51 @@ class QuasarDesktopApp(QMainWindow):
             )
         worker = LocalSpeechOutputWorker(spoken_text, self.signals)
         self.speech_worker = worker
+        self.send_button.setText("음성 중지")
+        self.send_button.setEnabled(True)
+        self.status_label.setText("답변 음성을 재생 중입니다. 버튼을 눌러 중지할 수 있습니다.")
         worker.start()
         return True
 
-    def _finish_speech(self) -> None:
+    def _stop_speech(self) -> None:
+        worker = self.speech_worker
+        if worker is None:
+            return
+        self.speech_worker = None
+        worker.stop()
+        if not self.busy:
+            self.send_button.setText("전송")
+            self.send_button.setEnabled(True)
+        self.status_label.setText("음성 출력을 중지했습니다.")
+        if self.voice_conversation_active:
+            self.galaxy_transition.set_conversation_status(
+                "음성을 멈췄습니다. 말씀해 주세요."
+            )
+            self._start_voice_conversation_capture()
+
+    def _finish_speech(self, worker: LocalSpeechOutputWorker) -> None:
         if self.closing or self.busy:
             return
+        if worker is not self.speech_worker:
+            return
+        self.speech_worker = None
+        self.send_button.setText("전송")
+        self.send_button.setEnabled(True)
         if self.voice_conversation_active:
             self._start_voice_conversation_capture()
         else:
             self.status_label.setText("음성 출력을 마쳤습니다.")
 
-    def _finish_speech_error(self, error: str) -> None:
+    def _finish_speech_error(
+        self,
+        worker: LocalSpeechOutputWorker,
+        error: str,
+    ) -> None:
+        if self.closing or worker is not self.speech_worker:
+            return
+        self.speech_worker = None
+        self.send_button.setText("전송")
+        self.send_button.setEnabled(True)
         if not self.closing:
             self.status_label.setText(f"음성 출력 실패: {error}")
             if self.voice_conversation_active:
@@ -2153,7 +2303,7 @@ class QuasarDesktopApp(QMainWindow):
                 self._start_voice_conversation_capture()
 
     def _show_request_progress(self, progress: str) -> None:
-        if self.closing:
+        if self.closing or self.request_cancel_pending:
             return
         if self.activity_body is not None:
             current_text = self.activity_body.text()
@@ -2163,9 +2313,15 @@ class QuasarDesktopApp(QMainWindow):
             )
         self.status_label.setText(progress)
 
-    def _finish_with_response(self, response: str) -> None:
+    def _finish_with_response(
+        self,
+        response: str,
+        request_messages: list[dict[str, Any]],
+    ) -> None:
         if self.closing:
             return
+        self.messages[:] = request_messages
+        self._clear_request_state()
         self.activity_body = None
         self._add_message("assistant", response)
         self._set_busy(False)
@@ -2178,15 +2334,28 @@ class QuasarDesktopApp(QMainWindow):
     def _finish_with_error(self, error: str) -> None:
         if self.closing:
             return
+        self._clear_request_state()
         self.activity_body = None
         self._add_message("assistant", f"요청 처리 실패: {error}")
         self._set_busy(False)
         if self.voice_conversation_active:
             self._start_voice_conversation_capture()
 
+    def _finish_cancelled_request(self) -> None:
+        if self.closing:
+            return
+        self._clear_request_state()
+        if self.activity_body is not None:
+            self.activity_body.setText("응답 생성을 중지했습니다.")
+        self.activity_body = None
+        self._set_busy(False)
+        if self.voice_conversation_active:
+            self._start_voice_conversation_capture()
+
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
-        self.send_button.setEnabled(not busy)
+        self.send_button.setText("중지" if busy else "전송")
+        self.send_button.setEnabled(True)
         self.provider_selector.setEnabled(not busy)
         self.model_selector.setEnabled(not busy)
         self.refresh_models_button.setEnabled(not busy)
@@ -2266,8 +2435,8 @@ class QuasarDesktopApp(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Quasar 종료",
-                "요청 처리 중입니다. 종료하면 현재 요청이 끝나지 않을 수 있습니다.\n"
-                "종료할까요?",
+                "요청 처리를 중지하고 종료합니다. 이미 실행 중인 외부 작업은 "
+                "완료될 수 있습니다.\n종료할까요?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -2275,6 +2444,17 @@ class QuasarDesktopApp(QMainWindow):
                 event.ignore()
                 return
         self.closing = True
+        if self.request_cancel_event is not None:
+            self.request_cancel_event.set()
+        if self.request_client is not None:
+            try:
+                self.request_client.close()
+            except Exception as error:
+                print(
+                    f"요청 연결 종료 실패: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         self.voice_conversation_active = False
         if self.voice_conversation_stop_event is not None:
             self.voice_conversation_stop_event.set()
