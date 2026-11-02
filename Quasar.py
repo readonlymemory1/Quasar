@@ -53,6 +53,8 @@ SYSTEM_PROMPT = (
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
     "Run requested commands without showing confirmation dialogs. "
     "Send email only when explicitly requested, and clarify ambiguous requests first. "
+    "For browser tasks, navigate to the requested page once, then continue interacting with the current page. "
+    "Do not navigate to or reload the same URL again unless the user explicitly asks to refresh or revisit it. "
     "Do not claim success until you have verified the tool result."
 )
 

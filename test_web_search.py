@@ -44,7 +44,8 @@ class WebSearchTests(unittest.TestCase):
     def test_navigation_opens_requested_url_in_controlled_chrome(self) -> None:
         page = Mock()
         page.title = "인천남동고등학교"
-        page.current_url = "https://namdong.icehs.kr/main.do"
+        page.current_url = "about:blank"
+        page.get.side_effect = lambda url: setattr(page, "current_url", url)
         with patch.object(quasar_cli, "get_browser", return_value=page) as get_browser:
             result = quasar_cli.run_tool("web_navigate", {"url": "https://namdong.icehs.kr/main.do"})
 
@@ -52,6 +53,21 @@ class WebSearchTests(unittest.TestCase):
         page.get.assert_called_once_with("https://namdong.icehs.kr/main.do")
         self.assertIn("페이지 이동 완료", result)
         self.assertIn("인천남동고등학교", result)
+
+    def test_navigation_does_not_reload_the_current_url(self) -> None:
+        page = Mock()
+        page.title = "Example"
+        page.current_url = "https://example.com/"
+        with (
+            patch.object(quasar_cli, "get_browser", return_value=page),
+            patch.object(quasar_cli, "browser_active_window_handle", "active-tab"),
+            patch.object(quasar_cli, "browser_tab_ids", {"active-tab": "tab-1"}),
+        ):
+            result = quasar_cli.web_navigate("https://example.com")
+
+        page.get.assert_not_called()
+        self.assertIn("이미 요청한 페이지에 있습니다", result)
+        self.assertIn("다시 불러오지 않았습니다", result)
 
     def test_open_new_tab_creates_tab_before_navigating(self) -> None:
         page = Mock()

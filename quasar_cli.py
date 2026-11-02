@@ -1468,6 +1468,13 @@ def web_navigate(url: str) -> str:
     url = url.strip()
     try:
         page = get_browser()
+        current_url = page.current_url
+        if current_url.rstrip("/") == url.rstrip("/"):
+            tab_id = browser_tab_ids.get(browser_active_window_handle or "", "탭")
+            return (
+                f"이미 요청한 페이지에 있습니다 ({tab_id}). 다시 불러오지 않았습니다.\n"
+                f"제목: {page.title}\n현재 URL: {current_url}"
+            )
         page.get(url)
         tab_id = browser_tab_ids.get(browser_active_window_handle or "", "탭")
         return f"페이지 이동 완료 ({tab_id})\n제목: {page.title}\n현재 URL: {page.current_url}"
@@ -2934,6 +2941,9 @@ def main(argv: list[str] | None = None) -> None:
         "When the user specifies a tab by number, ID, or title, identify it with web_list_tabs if needed and use "
         "web_switch_tab before any browser action; keep using that selected tab until the user specifies another. "
         "If no tab is specified, use the currently selected tab. Browser actions operate in the selected tab. "
+        "When a requested URL is already open in the selected tab, do not call web_navigate again; continue with "
+        "web_click, web_input, web_scroll, or another relevant action on that page. Do not repeat a successful "
+        "browser action unless the user asks for it or new information requires it. "
         "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
         "Never promise a retry before making it or claim success without a confirming tool result. For web_input, inspect the returned "
         "result and do not claim text was entered or sent unless verified. "
