@@ -1,4 +1,8 @@
+import json
+import threading
+import tempfile
 import unittest
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
@@ -6,6 +10,72 @@ import Quasar
 
 
 class OfficeMonitorGuiTests(unittest.TestCase):
+    def test_chat_restores_persisted_office_watchlist_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            watchlist_path = workspace / ".quasar" / "collaboration_office.json"
+            watchlist_path.parent.mkdir()
+            watchlist_path.write_text(
+                json.dumps([str(workspace / "notes.docx")]),
+                encoding="utf-8",
+            )
+            monitor = Mock()
+            app = SimpleNamespace(
+                office_monitor=None,
+                _ensure_office_monitor=Mock(return_value=monitor),
+            )
+
+            with patch.object(Quasar, "__file__", str(workspace / "Quasar.py")):
+                restored = Quasar.QuasarDesktopApp._office_monitor_for_chat(app)
+
+        self.assertIs(restored, monitor)
+        app._ensure_office_monitor.assert_called_once_with()
+
+    def test_chat_request_loads_connected_office_context(self) -> None:
+        monitor = Mock()
+        monitor.office_chat_context.return_value = (
+            "\n[연결 문서]\n중요한 사실",
+            [],
+            1,
+        )
+        client = Mock()
+        signals = SimpleNamespace(
+            request_progress=Mock(),
+            response_ready=Mock(),
+            request_failed=Mock(),
+            request_cancelled=Mock(),
+        )
+        app = SimpleNamespace(signals=signals)
+
+        with patch.object(
+            Quasar.agent,
+            "request_agent",
+            return_value="답변",
+        ) as request_agent:
+            Quasar.QuasarDesktopApp._request_response(
+                app,
+                client,
+                "gpt-4o",
+                "연결 문서 질문",
+                [{"role": "system", "content": "system prompt"}],
+                threading.Event(),
+                monitor,
+            )
+
+        monitor.office_chat_context.assert_called_once_with()
+        signals.request_progress.emit.assert_called_once_with(
+            "연결된 문서 1개를 참고합니다."
+        )
+        self.assertEqual(
+            request_agent.call_args.kwargs["office_context"],
+            "\n[연결 문서]\n중요한 사실",
+        )
+        signals.response_ready.emit.assert_called_once_with(
+            "답변",
+            [{"role": "system", "content": "system prompt"}],
+        )
+        client.close.assert_called_once_with()
+
     def test_cli_handler_returns_help_to_gui_output_callback(self) -> None:
         output: list[str] = []
 
@@ -98,6 +168,9 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             office_monitor=monitor,
             office_monitor_client=client,
             office_monitor_source=object(),
+            _close_office_client_after_monitor=(
+                Quasar.QuasarDesktopApp._close_office_client_after_monitor
+            ),
         )
 
         Quasar.QuasarDesktopApp._dispose_office_monitor(app)
@@ -108,6 +181,38 @@ class OfficeMonitorGuiTests(unittest.TestCase):
         self.assertIsNone(app.office_monitor)
         self.assertIsNone(app.office_monitor_client)
         self.assertIsNone(app.office_monitor_source)
+
+    def test_dispose_defers_client_close_until_active_monitor_stops(self) -> None:
+        monitor = Mock()
+        monitor.close.return_value = False
+        client = Mock()
+        app = SimpleNamespace(
+            office_monitor=monitor,
+            office_monitor_client=client,
+            office_monitor_source=object(),
+            _close_office_client_after_monitor=(
+                Quasar.QuasarDesktopApp._close_office_client_after_monitor
+            ),
+        )
+        cleanup_thread = Mock()
+        with patch.object(
+            Quasar.threading,
+            "Thread",
+            return_value=cleanup_thread,
+        ) as create_thread:
+            Quasar.QuasarDesktopApp._dispose_office_monitor(app)
+
+        client.close.assert_not_called()
+        cleanup_thread.start.assert_called_once_with()
+        create_thread.assert_called_once()
+        arguments = create_thread.call_args.kwargs["args"]
+        self.assertIs(arguments[0], monitor)
+        self.assertIs(arguments[1], client)
+
+        create_thread.call_args.kwargs["target"](*arguments)
+
+        monitor.wait_until_closed.assert_called_once_with()
+        client.close.assert_called_once_with()
 
     def test_model_change_stops_active_monitor(self) -> None:
         monitor = Mock()
@@ -136,7 +241,7 @@ class OfficeMonitorGuiTests(unittest.TestCase):
         monitor.close.assert_called_once_with()
         client.close.assert_called_once_with()
         app.status_label.setText.assert_called_once_with(
-            "AI 모델이 변경되어 Word/PPT 감시를 중지했습니다. 다시 켜 주세요."
+            "AI 모델이 변경되어 문서 감시를 중지했습니다. 다시 켜 주세요."
         )
 
     def test_poll_routes_questions_and_proposals_to_chat(self) -> None:
@@ -150,11 +255,13 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             office_monitor=monitor,
             _add_message=Mock(),
             _show_office_proposal=Mock(),
+            _queue_collaboration_speech=Mock(),
         )
 
         Quasar.QuasarDesktopApp._poll_office_monitor(app)
 
         app._add_message.assert_called_once_with("assistant", "문서 질문")
+        app._queue_collaboration_speech.assert_called_once_with("문서 질문")
         app._show_office_proposal.assert_called_once_with(
             7,
             {"path": "notes.docx"},

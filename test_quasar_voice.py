@@ -4,6 +4,8 @@ import threading
 import types
 import unittest
 import wave
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -13,6 +15,145 @@ import Quasar
 
 
 class VoiceWorkerTests(unittest.TestCase):
+    def test_collaboration_messages_are_queued_until_response_finishes(self) -> None:
+        class FakeToggle:
+            def isChecked(self) -> bool:
+                return True
+
+        app = types.SimpleNamespace(
+            closing=False,
+            voice_response_toggle=FakeToggle(),
+            pending_speech_messages=Quasar.deque(),
+            busy=True,
+            speech_worker=None,
+            _speak_response=Mock(return_value=True),
+            _start_next_pending_speech=Mock(
+                side_effect=lambda: Quasar.QuasarDesktopApp._start_next_pending_speech(
+                    app
+                )
+            ),
+        )
+
+        Quasar.QuasarDesktopApp._queue_collaboration_speech(
+            app,
+            "문서에 질문이 있습니다.",
+        )
+
+        self.assertEqual(
+            list(app.pending_speech_messages),
+            ["문서에 질문이 있습니다."],
+        )
+        app._speak_response.assert_not_called()
+        app.busy = False
+
+        started = Quasar.QuasarDesktopApp._start_next_pending_speech(app)
+
+        self.assertTrue(started)
+        app._speak_response.assert_called_once_with("문서에 질문이 있습니다.")
+        self.assertEqual(list(app.pending_speech_messages), [])
+
+    def test_collaboration_speech_respects_tts_toggle_and_stop_clears_queue(self) -> None:
+        class FakeToggle:
+            def __init__(self) -> None:
+                self.enabled = False
+
+            def isChecked(self) -> bool:
+                return self.enabled
+
+        app = types.SimpleNamespace(
+            closing=False,
+            voice_response_toggle=FakeToggle(),
+            pending_speech_messages=Quasar.deque(),
+            busy=False,
+            speech_worker=None,
+            _speak_response=Mock(return_value=True),
+        )
+
+        Quasar.QuasarDesktopApp._queue_collaboration_speech(app, "질문")
+        self.assertEqual(list(app.pending_speech_messages), [])
+        app._speak_response.assert_not_called()
+
+        app.pending_speech_messages.append("대기 중인 문서 알림")
+        app.voice_response_toggle.enabled = True
+        Quasar.QuasarDesktopApp._stop_speech(app)
+        self.assertEqual(list(app.pending_speech_messages), [])
+
+    def test_message_to_user_tool_emits_progress_and_recovery_updates(self) -> None:
+        updates: list[str] = []
+        app = types.SimpleNamespace(
+            signals=types.SimpleNamespace(
+                request_progress=types.SimpleNamespace(emit=updates.append)
+            ),
+            original_run_tool=Mock(),
+        )
+
+        progress_result = Quasar.QuasarDesktopApp._run_tool(
+            app,
+            "message_to_user",
+            {
+                "message": "파일을 확인했고 테스트를 실행합니다.",
+                "kind": "progress",
+            },
+        )
+        error_result = Quasar.QuasarDesktopApp._run_tool(
+            app,
+            "message_to_user",
+            {
+                "message": "API가 시간 초과되어 한 번 재시도합니다.",
+                "kind": "error",
+            },
+        )
+
+        self.assertEqual(progress_result, "메시지를 사용자 채팅에 표시했습니다.")
+        self.assertEqual(error_result, "메시지를 사용자 채팅에 표시했습니다.")
+        self.assertEqual(
+            updates,
+            [
+                "진행 상황: 파일을 확인했고 테스트를 실행합니다.",
+                "오류 및 복구: API가 시간 초과되어 한 번 재시도합니다.",
+            ],
+        )
+        app.original_run_tool.assert_not_called()
+
+    def test_message_to_user_tool_rejects_empty_or_oversized_updates(self) -> None:
+        app = types.SimpleNamespace(
+            signals=types.SimpleNamespace(
+                request_progress=types.SimpleNamespace(emit=Mock())
+            ),
+            original_run_tool=Mock(),
+        )
+
+        for arguments in (
+            {"message": "  "},
+            {"message": "업데이트", "kind": "unknown"},
+            {"message": "x" * 1201, "kind": "progress"},
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    Quasar.QuasarDesktopApp._run_tool(
+                        app,
+                        "message_to_user",
+                        arguments,
+                    )
+
+    def test_cli_message_to_user_displays_the_update_and_validates_kind(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            result = Quasar.agent.run_tool(
+                "message_to_user",
+                {"message": "검색을 마치고 결과를 비교합니다.", "kind": "progress"},
+            )
+
+        self.assertEqual(result, "메시지를 사용자에게 전달했습니다.")
+        self.assertIn("Quasar (진행): 검색을 마치고 결과를 비교합니다.", output.getvalue())
+        self.assertIn(
+            "1200 characters or fewer",
+            Quasar.agent.run_tool(
+                "message_to_user",
+                {"message": "x" * 1201},
+            ),
+        )
+
     def test_capture_is_transcribed_locally_as_korean(self) -> None:
         captured: list[np.ndarray] = []
         errors: list[str] = []
@@ -594,6 +735,7 @@ class VoiceWorkerTests(unittest.TestCase):
         Quasar.QuasarDesktopApp._set_tts_enabled(
             types.SimpleNamespace(
                 voice_response_toggle=toggle,
+                pending_speech_messages=Quasar.deque(),
                 settings=settings,
                 speech_worker=object(),
                 _stop_speech=stop_speech,
@@ -662,6 +804,7 @@ class VoiceWorkerTests(unittest.TestCase):
         start_capture = Mock()
         app = types.SimpleNamespace(
             speech_worker=speech_worker,
+            pending_speech_messages=Quasar.deque(),
             busy=False,
             voice_conversation_active=True,
             send_button=Mock(),
@@ -702,11 +845,13 @@ class VoiceWorkerTests(unittest.TestCase):
             activity_body=object(),
             messages=[{"role": "system", "content": "system"}],
             voice_response_toggle=FakeToggle(),
+            pending_speech_messages=Quasar.deque(),
             voice_conversation_active=True,
             _clear_request_state=Mock(),
             _add_message=Mock(),
             _set_busy=Mock(),
             _speak_response=Mock(return_value=True),
+            _start_next_pending_speech=Mock(return_value=False),
             _start_voice_conversation_capture=Mock(),
         )
 

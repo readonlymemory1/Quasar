@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import locale
 import os
 import shutil
 import tempfile
@@ -15,7 +16,8 @@ from docx import Document
 from pptx import Presentation
 
 
-SUPPORTED_OFFICE_SUFFIXES = {".docx", ".pptx"}
+SUPPORTED_COLLABORATION_DOCUMENT_SUFFIXES = {".docx", ".pptx", ".txt"}
+SUPPORTED_OFFICE_SUFFIXES = SUPPORTED_COLLABORATION_DOCUMENT_SUFFIXES
 
 
 @dataclass
@@ -30,6 +32,44 @@ class OfficeDocument:
     source_hash: str
     segments: list[OfficeTextSegment]
     document: Any
+
+
+@dataclass
+class PlainTextDocument:
+    lines: list[str]
+    encoding: str
+
+
+def _read_plain_text(data: bytes, source_hash: str) -> OfficeDocument:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif data.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            encoding = "mbcs" if os.name == "nt" else locale.getpreferredencoding(False)
+            text = data.decode(encoding)
+        else:
+            encoding = "utf-8"
+    if encoding in {"utf-16", "utf-8-sig"}:
+        text = data.decode(encoding)
+
+    lines = text.splitlines(keepends=True)
+    segments: list[OfficeTextSegment] = []
+    for line_index, line in enumerate(lines):
+        if line.endswith("\r\n"):
+            content = line[:-2]
+        elif line.endswith(("\r", "\n")):
+            content = line[:-1]
+        else:
+            content = line
+        if content.strip():
+            segments.append(
+                OfficeTextSegment(f"text/line/{line_index}", content, line_index)
+            )
+    return OfficeDocument(source_hash, segments, PlainTextDocument(lines, encoding))
 
 
 def _append_word_table_segments(
@@ -121,11 +161,13 @@ def load_office_document(path: Path, data: bytes | None = None) -> OfficeDocumen
     source = path.read_bytes() if data is None else data
     source_hash = hashlib.sha256(source).hexdigest()
     suffix = path.suffix.lower()
+    if suffix == ".txt":
+        return _read_plain_text(source, source_hash)
     if suffix == ".docx":
         return _read_word_document(source, source_hash)
     if suffix == ".pptx":
         return _read_presentation(source, source_hash)
-    raise ValueError(f"지원하지 않는 Office 문서 형식입니다: {path.suffix}")
+    raise ValueError(f"지원하지 않는 공동작업 문서 형식입니다: {path.suffix}")
 
 
 def _replace_segment_text(segment: OfficeTextSegment, replacement: str) -> None:
@@ -160,7 +202,9 @@ def apply_office_replacement(
     expected_text: str,
     replacement: str,
 ) -> Path:
-    if any(lock_path.exists() for lock_path in _office_lock_paths(path)):
+    if path.suffix.lower() != ".txt" and any(
+        lock_path.exists() for lock_path in _office_lock_paths(path)
+    ):
         raise PermissionError(
             "문서가 Word 또는 PowerPoint에서 열려 있는 것 같습니다. "
             "앱에서 문서를 닫은 뒤 승인 명령을 다시 실행해 주세요."
@@ -178,7 +222,21 @@ def apply_office_replacement(
     if len(matches) != 1:
         raise ValueError("수정 대상 문단이 현재 문서와 일치하지 않습니다. 다시 검토해 주세요.")
 
-    _replace_segment_text(matches[0], replacement)
+    if path.suffix.lower() == ".txt":
+        if "\n" in replacement or "\r" in replacement:
+            raise ValueError("메모장 수정 제안은 한 줄 안에서만 적용할 수 있습니다.")
+        text_document = office_document.document
+        line_index = matches[0].paragraph
+        existing_line = text_document.lines[line_index]
+        if existing_line.endswith("\r\n"):
+            ending = "\r\n"
+        elif existing_line.endswith(("\r", "\n")):
+            ending = existing_line[-1]
+        else:
+            ending = ""
+        text_document.lines[line_index] = replacement + ending
+    else:
+        _replace_segment_text(matches[0], replacement)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -190,7 +248,14 @@ def apply_office_replacement(
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
 
-        office_document.document.save(str(temporary_path))
+        if path.suffix.lower() == ".txt":
+            temporary_path.write_bytes(
+                "".join(office_document.document.lines).encode(
+                    office_document.document.encoding
+                )
+            )
+        else:
+            office_document.document.save(str(temporary_path))
         verified = load_office_document(temporary_path)
         if not any(
             segment.reference == target_reference and segment.text == replacement
@@ -200,7 +265,9 @@ def apply_office_replacement(
 
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
             raise ValueError("저장 직전에 문서가 변경되어 수정하지 않았습니다.")
-        if any(lock_path.exists() for lock_path in _office_lock_paths(path)):
+        if path.suffix.lower() != ".txt" and any(
+            lock_path.exists() for lock_path in _office_lock_paths(path)
+        ):
             raise PermissionError(
                 "문서가 Word 또는 PowerPoint에서 열려 있어 수정하지 않았습니다."
             )

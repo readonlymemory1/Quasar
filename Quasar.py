@@ -62,6 +62,10 @@ ACCENT = "#9b91ff"
 SYSTEM_PROMPT = (
     "You are Quasar. Respond concisely and accurately in the language the user uses, "
     "especially Korean or English. "
+    "Use message_to_user as a live status channel for multi-step work: announce a meaningful phase before a lengthy wait, "
+    "report completed milestones or changed plans, and immediately report tool failures with the cause and your recovery attempt. "
+    "After recovery, update the user and verify the outcome. Keep updates brief and actionable; avoid routine narration, duplicates, "
+    "and updates for simple questions or quick actions. Do not claim completion until verified. "
     "When the user asks to turn spoken responses on or off, use the set_tts_enabled tool. "
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
     "Run requested commands without showing confirmation dialogs. "
@@ -1400,6 +1404,7 @@ class QuasarDesktopApp(QMainWindow):
             self._retry_voice_conversation
         )
         self.speech_worker: LocalSpeechOutputWorker | None = None
+        self.pending_speech_messages: deque[str] = deque()
         self.signals = AppSignals(self)
         self.signals.response_ready.connect(self._finish_with_response)
         self.signals.request_cancelled.connect(self._finish_cancelled_request)
@@ -1500,11 +1505,11 @@ class QuasarDesktopApp(QMainWindow):
         self.settings_button.setMinimumHeight(40)
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.settings_button)
-        self.office_watch_button = QPushButton("Word/PPT 감시")
+        self.office_watch_button = QPushButton("문서 감시")
         self.office_watch_button.setMinimumHeight(40)
         self.office_watch_button.clicked.connect(self._open_office_watch_dialog)
         self.office_watch_button.setToolTip(
-            "저장된 Word/PPT 파일을 등록하고 공동작업 감시를 설정합니다."
+            "저장된 Word/PPT/메모장 텍스트 파일을 공동작업 목록에 등록합니다."
         )
         header.addWidget(self.office_watch_button)
         layout.addWidget(top_bar)
@@ -1622,12 +1627,12 @@ class QuasarDesktopApp(QMainWindow):
         layout.addLayout(composer_row)
 
         hint_row = QHBoxLayout()
-        self.voice_response_toggle = QCheckBox("답변 음성")
+        self.voice_response_toggle = QCheckBox("답변/공동작업 음성")
         self.voice_response_toggle.setChecked(
             self.settings.value("voice/tts_enabled", True, type=bool)
         )
         self.voice_response_toggle.setToolTip(
-            "AI 답변 음성을 켜거나 끕니다. 음성 대화에도 적용됩니다."
+            "AI 답변과 공동작업 질문·수정 제안 음성을 켜거나 끕니다."
         )
         self.voice_response_toggle.toggled.connect(self._set_tts_enabled)
         hint_row.addWidget(self.voice_response_toggle)
@@ -1698,7 +1703,7 @@ class QuasarDesktopApp(QMainWindow):
         self._refresh_status()
         if office_monitor_was_enabled:
             self.status_label.setText(
-                "AI 공급자가 변경되어 Word/PPT 감시를 중지했습니다. 다시 켜 주세요."
+                "AI 공급자가 변경되어 문서 감시를 중지했습니다. 다시 켜 주세요."
             )
         if self.client is not None:
             self._load_model_options()
@@ -1708,7 +1713,7 @@ class QuasarDesktopApp(QMainWindow):
         if model:
             if model != self.model and self._reset_office_monitor():
                 self.status_label.setText(
-                    "AI 모델이 변경되어 Word/PPT 감시를 중지했습니다. 다시 켜 주세요."
+                    "AI 모델이 변경되어 문서 감시를 중지했습니다. 다시 켜 주세요."
                 )
             self.model = model
 
@@ -1948,23 +1953,54 @@ class QuasarDesktopApp(QMainWindow):
         self.office_monitor = monitor
         return monitor
 
+    def _office_monitor_for_chat(
+        self,
+    ) -> agent.CliCollaborationMonitor | None:
+        if self.office_monitor is not None:
+            return self.office_monitor
+        workspace = Path(__file__).resolve().parent
+        watchlist_path = workspace / ".quasar" / "collaboration_office.json"
+        if not watchlist_path.is_file():
+            return None
+        try:
+            watchlist = json.loads(watchlist_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"연결된 Office 파일 목록을 읽지 못했습니다: {error}") from error
+        if not isinstance(watchlist, list) or not all(
+            isinstance(path, str) for path in watchlist
+        ):
+            raise ValueError("연결된 Office 파일 목록 형식이 올바르지 않습니다.")
+        if not watchlist:
+            return None
+        return self._ensure_office_monitor()
+
     def _dispose_office_monitor(self) -> None:
         monitor = self.office_monitor
         client = self.office_monitor_client
         self.office_monitor = None
         self.office_monitor_client = None
         self.office_monitor_source = None
+        monitor_stopped = True
         if monitor is not None:
             try:
                 monitor.set_enabled(False)
-                monitor.close()
+                monitor_stopped = monitor.close()
             except Exception as error:
+                monitor_stopped = False
                 print(
                     f"Office 감시 종료 실패: {type(error).__name__}: {error}",
                     file=sys.stderr,
                     flush=True,
                 )
         if client is not None:
+            if monitor is not None and not monitor_stopped:
+                threading.Thread(
+                    target=self._close_office_client_after_monitor,
+                    args=(monitor, client),
+                    name="quasar-office-client-cleanup",
+                    daemon=True,
+                ).start()
+                return
             try:
                 client.close()
             except Exception as error:
@@ -1973,6 +2009,21 @@ class QuasarDesktopApp(QMainWindow):
                     file=sys.stderr,
                     flush=True,
                 )
+
+    @staticmethod
+    def _close_office_client_after_monitor(
+        monitor: agent.CliCollaborationMonitor,
+        client: Any,
+    ) -> None:
+        monitor.wait_until_closed()
+        try:
+            client.close()
+        except Exception as error:
+            print(
+                f"Office 감시 연결 종료 실패: {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _reset_office_monitor(self) -> bool:
         monitor = self.office_monitor
@@ -1994,12 +2045,14 @@ class QuasarDesktopApp(QMainWindow):
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Word/PPT 공동작업 감시")
+        dialog.setWindowTitle("문서 공동작업 감시")
         dialog.setMinimumWidth(560)
         layout = QVBoxLayout(dialog)
         description = QLabel(
-            "등록한 Word/PPT 파일은 저장 후 검토합니다. 문서 내용이 선택된 AI 제공자에 "
-            "전송될 수 있으며, 문서는 수정 제안을 승인할 때만 변경됩니다."
+            "등록한 Word/PPT/메모장 텍스트 파일은 저장 후 검토합니다. 문서 내용이 선택된 AI 제공자에 "
+            "전송될 수 있고, 일반 채팅 질문에도 참고 문맥으로 포함됩니다. 문서는 수정 "
+            "제안을 승인할 때만 변경됩니다. 텍스트 편집기에 저장하지 않은 내용은 감지하지 "
+            "못하므로 수정 제안을 적용하기 전에 저장해 주세요."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -2028,9 +2081,9 @@ class QuasarDesktopApp(QMainWindow):
         def add_office_file() -> None:
             file_path, _selected_filter = QFileDialog.getOpenFileName(
                 dialog,
-                "감시할 Word 또는 PowerPoint 파일 선택",
+                "감시할 Word, PowerPoint 또는 메모장 텍스트 파일 선택",
                 str(Path.home()),
-                "Office 문서 (*.docx *.pptx)",
+                "공동작업 문서 (*.docx *.pptx *.txt)",
             )
             if not file_path:
                 return
@@ -2086,12 +2139,12 @@ class QuasarDesktopApp(QMainWindow):
                 return
             monitor.set_enabled(True)
             self.status_label.setText(
-                f"Word/PPT 감시 중 · {len(monitor.list_office_documents())}개 파일"
+                f"문서 감시 중 · {len(monitor.list_office_documents())}개 파일"
             )
             return
         if self.office_monitor is not None:
             self.office_monitor.set_enabled(False)
-            self.status_label.setText("Word/PPT 감시를 껐습니다.")
+            self.status_label.setText("문서 감시를 껐습니다.")
 
     def _poll_office_monitor(self) -> None:
         monitor = self.office_monitor
@@ -2099,6 +2152,7 @@ class QuasarDesktopApp(QMainWindow):
             return
         for question in monitor.take_pending_questions():
             self._add_message("assistant", question)
+            self._queue_collaboration_speech(question)
         for proposal_id, proposal in monitor.take_pending_office_proposals():
             self._show_office_proposal(proposal_id, proposal)
 
@@ -2111,12 +2165,19 @@ class QuasarDesktopApp(QMainWindow):
         if monitor is None:
             return
         content = (
-            f"**Office 수정 제안 {proposal_id}** · `{Path(proposal['path']).name}`\n\n"
+            f"**문서 수정 제안 {proposal_id}** · `{Path(proposal['path']).name}`\n\n"
             f"이유: {proposal['reason']}\n\n"
             f"기존 문단:\n> {proposal['before']}\n\n"
             f"수정 제안:\n> {proposal['replacement']}"
         )
         bubble, _body = self._add_message("assistant", content)
+        spoken_proposal = (
+            f"{Path(proposal['path']).name}에 수정 제안이 있습니다. "
+            f"이유: {proposal['reason']}. "
+            f"제안 내용: {proposal['replacement']}. "
+            "채팅에서 승인하거나 거절할 수 있습니다."
+        )
+        self._queue_collaboration_speech(spoken_proposal)
         buttons = QHBoxLayout()
         approve_button = QPushButton("승인하고 적용")
         reject_button = QPushButton("거절")
@@ -2137,6 +2198,9 @@ class QuasarDesktopApp(QMainWindow):
             approve_button.setEnabled(False)
             reject_button.setEnabled(False)
             self._add_message("assistant", result)
+            self._queue_collaboration_speech(
+                f"문서 수정 제안을 {'적용했습니다' if approved else '거절했습니다'}."
+            )
 
         approve_button.clicked.connect(lambda: finish_proposal(True))
         reject_button.clicked.connect(lambda: finish_proposal(False))
@@ -2197,6 +2261,11 @@ class QuasarDesktopApp(QMainWindow):
                 raise ValueError("set_tts_enabled requires a boolean 'enabled' value.")
             self.signals.tts_enabled_requested.emit(enabled)
             return f"Quasar spoken responses {'enabled' if enabled else 'disabled'}."
+        if name == "message_to_user":
+            message, kind = agent.validate_user_message(arguments)
+            label = "오류 및 복구" if kind == "error" else "진행 상황"
+            self.signals.request_progress.emit(f"{label}: {message}")
+            return "메시지를 사용자 채팅에 표시했습니다."
         return self.original_run_tool(
             name,
             arguments,
@@ -2231,6 +2300,15 @@ class QuasarDesktopApp(QMainWindow):
         if not self.model:
             self._add_message("assistant", "사용할 모델을 선택하거나 모델 이름을 입력해 주세요.")
             return
+        office_monitor_error = ""
+        try:
+            office_monitor = self._office_monitor_for_chat()
+        except Exception as error:
+            office_monitor = None
+            office_monitor_error = (
+                f"연결된 문서를 채팅 문맥에 불러오지 못했습니다: "
+                f"{type(error).__name__}: {error}"
+            )
         try:
             request_client, request_model = agent.create_client(
                 self.provider,
@@ -2257,6 +2335,8 @@ class QuasarDesktopApp(QMainWindow):
         self.orb.start_submission()
         self.composer.clear()
         self._add_message("user", prompt)
+        if office_monitor_error:
+            self._add_message("assistant", office_monitor_error)
         _activity_bubble, self.activity_body = self._add_message(
             "assistant",
             "요청을 분석하고 있습니다...",
@@ -2272,7 +2352,14 @@ class QuasarDesktopApp(QMainWindow):
         model = request_model
         worker = threading.Thread(
             target=self._request_response,
-            args=(request_client, model, prompt, request_messages, cancel_event),
+            args=(
+                request_client,
+                model,
+                prompt,
+                request_messages,
+                cancel_event,
+                office_monitor,
+            ),
             daemon=True,
         )
         self.worker_thread = worker
@@ -2285,9 +2372,25 @@ class QuasarDesktopApp(QMainWindow):
         prompt: str,
         messages: list[dict[str, Any]],
         cancel_event: threading.Event,
+        office_monitor: agent.CliCollaborationMonitor | None = None,
     ) -> None:
         try:
             try:
+                office_context = ""
+                if office_monitor is not None:
+                    (
+                        office_context,
+                        office_context_errors,
+                        included_documents,
+                    ) = office_monitor.office_chat_context()
+                    if included_documents:
+                        self.signals.request_progress.emit(
+                            f"연결된 문서 {included_documents}개를 참고합니다."
+                        )
+                    for error in office_context_errors:
+                        self.signals.request_progress.emit(
+                            f"연결 문서를 읽지 못했습니다: {error}"
+                        )
                 response = agent.request_agent(
                     client,
                     model,
@@ -2297,6 +2400,7 @@ class QuasarDesktopApp(QMainWindow):
                     mcp_manager=None,
                     progress_callback=self.signals.request_progress.emit,
                     cancel_event=cancel_event,
+                    office_context=office_context,
                 )
             except InterruptedError:
                 self.signals.request_cancelled.emit()
@@ -2537,30 +2641,56 @@ class QuasarDesktopApp(QMainWindow):
         self.settings.sync()
         if not enabled and self.speech_worker is not None:
             self._stop_speech()
+        if not enabled:
+            self.pending_speech_messages.clear()
 
     def _speak_response(self, response: str) -> bool:
         spoken_text = re.sub(r"```.*?```", "코드 블록", response, flags=re.DOTALL)
         spoken_text = re.sub(r"[*_#`>]", "", spoken_text).strip()
         if not spoken_text:
             return False
-        self.status_label.setText("답변을 음성으로 읽고 있습니다...")
+        self.status_label.setText("음성 출력을 시작하고 있습니다...")
         if self.voice_conversation_active:
             self.galaxy_transition.set_conversation_status(
-                "답변을 음성으로 들려드리고 있습니다..."
+                "음성 출력을 재생하고 있습니다..."
             )
         worker = LocalSpeechOutputWorker(spoken_text, self.signals)
         self.speech_worker = worker
         self.send_button.setText("음성 중지")
         self.send_button.setEnabled(True)
-        self.status_label.setText("답변 음성을 재생 중입니다. 버튼을 눌러 중지할 수 있습니다.")
+        self.status_label.setText("음성을 재생 중입니다. 버튼을 눌러 중지할 수 있습니다.")
         worker.start()
         return True
+
+    def _queue_collaboration_speech(self, message: str) -> None:
+        if (
+            self.closing
+            or not self.voice_response_toggle.isChecked()
+            or not message.strip()
+        ):
+            return
+        self.pending_speech_messages.append(message.strip())
+        self._start_next_pending_speech()
+
+    def _start_next_pending_speech(self) -> bool:
+        if self.closing or not self.voice_response_toggle.isChecked():
+            self.pending_speech_messages.clear()
+            return False
+        if self.busy or self.speech_worker is not None:
+            return False
+        while self.pending_speech_messages:
+            message = self.pending_speech_messages.popleft()
+            if self._speak_response(message):
+                return True
+        return False
 
     def _stop_speech(self) -> None:
         worker = self.speech_worker
         if worker is None:
+            self.pending_speech_messages.clear()
             return
         self.speech_worker = None
+        self.pending_speech_messages.clear()
         worker.stop()
         if not self.busy:
             self.send_button.setText("전송")
@@ -2580,6 +2710,8 @@ class QuasarDesktopApp(QMainWindow):
         self.speech_worker = None
         self.send_button.setText("전송")
         self.send_button.setEnabled(True)
+        if self._start_next_pending_speech():
+            return
         if self.voice_conversation_active:
             self._start_voice_conversation_capture()
         else:
@@ -2595,6 +2727,8 @@ class QuasarDesktopApp(QMainWindow):
         self.speech_worker = None
         self.send_button.setText("전송")
         self.send_button.setEnabled(True)
+        if self._start_next_pending_speech():
+            return
         if not self.closing:
             self.status_label.setText(f"음성 출력 실패: {error}")
             if self.voice_conversation_active:
@@ -2627,9 +2761,11 @@ class QuasarDesktopApp(QMainWindow):
         self._add_message("assistant", response)
         self._set_busy(False)
         if self.voice_response_toggle.isChecked():
-            if not self._speak_response(response) and self.voice_conversation_active:
-                self._start_voice_conversation_capture()
-        elif self.voice_conversation_active:
+            if self._speak_response(response):
+                return
+        if self._start_next_pending_speech():
+            return
+        if self.voice_conversation_active:
             self._start_voice_conversation_capture()
 
     def _finish_with_error(self, error: str) -> None:
@@ -2639,6 +2775,8 @@ class QuasarDesktopApp(QMainWindow):
         self.activity_body = None
         self._add_message("assistant", f"요청 처리 실패: {error}")
         self._set_busy(False)
+        if self._start_next_pending_speech():
+            return
         if self.voice_conversation_active:
             self._start_voice_conversation_capture()
 
@@ -2650,6 +2788,8 @@ class QuasarDesktopApp(QMainWindow):
             self.activity_body.setText("응답 생성을 중지했습니다.")
         self.activity_body = None
         self._set_busy(False)
+        if self._start_next_pending_speech():
+            return
         if self.voice_conversation_active:
             self._start_voice_conversation_capture()
 
