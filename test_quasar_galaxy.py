@@ -12,14 +12,18 @@ class GalaxyTransitionPerformanceTests(unittest.TestCase):
             _animation_complete=True,
             _animation_target=1.0,
             clock=0.0,
-            timer=types.SimpleNamespace(interval=lambda: 16),
+            timer=types.SimpleNamespace(
+                interval=lambda: 33,
+                setInterval=Mock(),
+            ),
             update=Mock(),
             orbit_layer=types.SimpleNamespace(update=Mock()),
         )
 
         GalaxyTransitionOverlay._advance(overlay)
 
-        self.assertAlmostEqual(overlay.clock, 0.016)
+        self.assertAlmostEqual(overlay.clock, 0.033)
+        overlay.timer.setInterval.assert_called_once_with(33)
         overlay.update.assert_called_once_with()
         overlay.orbit_layer.update.assert_called_once_with()
 

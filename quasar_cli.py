@@ -70,6 +70,7 @@ browser_tab_ids: dict[str, str] = {}
 browser_tab_owners: dict[str, str] = {}
 browser_next_tab_id = 1
 scheduled_jobs: list[dict[str, str]] = []
+alarm_notification_callback: Callable[[str], None] | None = None
 auto_approve_commands = True
 allow_python_run = False
 debug_mode = False
@@ -1517,12 +1518,32 @@ def get_current_time() -> str:
 
 
 def _trigger_alarm(message: str) -> None:
-    for _ in range(3):
-        if platform.system() == "Windows":
-            winsound.Beep(1000, 500)
-        else:
-            print("\a", end="", flush=True)
-        time.sleep(0.2)
+    sound_error: OSError | RuntimeError | None = None
+    try:
+        for _ in range(3):
+            if platform.system() == "Windows":
+                winsound.Beep(1000, 500)
+            else:
+                print("\a", end="", flush=True)
+            time.sleep(0.2)
+    except (OSError, RuntimeError) as error:
+        sound_error = error
+
+    if sound_error is not None:
+        print(
+            f"\n알람 소리 재생 실패: {type(sound_error).__name__}: {sound_error}",
+            file=sys.stderr,
+            flush=True,
+        )
+    if alarm_notification_callback is not None:
+        try:
+            alarm_notification_callback(message)
+        except (OSError, RuntimeError) as error:
+            print(
+                f"\n알람 화면 알림 실패: {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
     print(f"\n🔔 [알람/타이머 종료!] {message}")
 
 
@@ -2668,7 +2689,7 @@ TOOLS = [
     tool_schema("discover_mcp_tools", "Search connected MCP tools when a request needs an integration not covered by the available tools. Provide an English query describing the required capability. Matching tool schemas will be available in the next step.", {"query": {"type": "string", "description": "English keywords for the needed tool or capability."}}, ["query"]),
     tool_schema(
         "message_to_user",
-        "Show a brief live update in the user's chat while a multi-step task is running. Use progress before a lengthy wait and after meaningful milestones; use error to explain a blocker and the recovery you are attempting. Do not send routine narration, duplicate updates, or updates for quick single-step requests. Keep each message actionable and under 1200 characters.",
+        "Show a brief live update in the user's chat while a multi-step task is running. Send progress before the first lengthy operation, after each meaningful phase, and before another lengthy wait; do not wait until the final answer. Use error immediately for a blocker and state the recovery you are attempting. Combine quick related actions instead of narrating every tool call. Avoid duplicate updates and quick single-step narration. Keep each message actionable and under 1200 characters.",
         {
             "message": {"type": "string", "description": "A concise user-facing status, next step, or error and recovery."},
             "kind": {"type": "string", "enum": ["progress", "error"]},
@@ -3526,9 +3547,12 @@ def main(argv: list[str] | None = None) -> None:
         "At the start of each request, identify its final goal and break it into small, concrete subgoals that can be completed in sequence. "
         "For multi-step tasks, briefly explain the goal and subgoals to the user first, then verify the result of each step. "
         "For simple, single-step tasks or questions, respond directly without unnecessary planning.\n\n"
-        "Use message_to_user intentionally as a live status channel: for multi-step work, announce the next meaningful phase before a lengthy wait, then report a completed milestone or changed plan. "
-        "When a tool fails or blocks progress, immediately use kind='error' to state the observed cause and your concrete recovery attempt; after recovery, send a progress update and verify the result. "
-        "Do not send routine narration, duplicate updates, or updates for simple questions and quick actions. Keep messages short, factual, and actionable; never claim completion until verified. "
+        "Use message_to_user proactively as a live status channel. For multi-step work, send a brief progress update before the first lengthy operation, "
+        "then report each meaningful phase completion and the next step before another lengthy wait; do not wait until the final answer. "
+        "For several quick related actions, combine them into one update rather than narrating every tool call. "
+        "When a tool fails or blocks progress, immediately use kind='error' to state the observed cause and your concrete recovery attempt; "
+        "after recovery, report the outcome and continue verifying. Do not send duplicate updates or routine narration for simple questions and quick actions. "
+        "Keep messages short, factual, and actionable; never claim completion until verified. "
         "If a tool result indicates failure, do not give up immediately: use available diagnostic tools to identify the cause, apply a safe fix, and verify the result. "
         "Do not repeat the same tool call with the same arguments and approach without a reason; adapt based on new information. "
         "After using a tool, forget its usage instructions. Before making another tool call, re-check the current request and the available tool definitions. "

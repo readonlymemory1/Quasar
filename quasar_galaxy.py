@@ -30,6 +30,8 @@ from PySide6.QtWidgets import QLabel, QWidget
 
 # 메시지가 블랙홀에 빨려 들어가는 시간(ms). 오브와 오버레이가 같은 값을 공유합니다.
 SWALLOW_MS = 1300
+GALAXY_TRANSITION_INTERVAL_MS = 33
+GALAXY_EXPANDED_INTERVAL_MS = 33
 
 # 원반 색: 중심(고온) → 바깥(저온)
 DISK_STOPS = (
@@ -86,6 +88,7 @@ class OrbWidget(QWidget):
 
     PARTICLE_COUNT = 160
     BASE_PARTICLE_COUNT = 110
+    EXPANDED_PARTICLE_COUNT = 100
     INNER = 27.0  # 원반 안쪽 반지름
     OUTER = 64.0  # 원반 바깥 반지름
     HOLE = 19.0  # 사건의 지평선 반지름
@@ -565,7 +568,7 @@ class GalaxyTransitionOverlay(QWidget):
             "font-size: 13px; font-weight: 600;"
         )
         self.timer = QTimer(self)
-        self.timer.setInterval(16)
+        self.timer.setInterval(GALAXY_TRANSITION_INTERVAL_MS)
         self.timer.timeout.connect(self._advance)
         self.hide()
 
@@ -615,16 +618,19 @@ class GalaxyTransitionOverlay(QWidget):
             self._animation_complete = False
 
         self.expanded_changed.emit(self._animation_target > 0.5)
+        self.orb.timer.setInterval(GALAXY_TRANSITION_INTERVAL_MS)
         self.orb.raise_()
         self.orbit_layer.raise_()
         self.conversation_status.raise_()
         self._animation_started = time.perf_counter()
+        self.timer.setInterval(GALAXY_TRANSITION_INTERVAL_MS)
         self.timer.start()
 
     def _advance(self) -> None:
         self.clock += self.timer.interval() / 1000
         if self._animation_complete:
             if self._animation_target > 0.5:
+                self.timer.setInterval(GALAXY_EXPANDED_INTERVAL_MS)
                 self.update()
                 self.orbit_layer.update()
             return
@@ -639,7 +645,7 @@ class GalaxyTransitionOverlay(QWidget):
         self.orb.particle_count = round(
             _mix(
                 OrbWidget.BASE_PARTICLE_COUNT,
-                OrbWidget.PARTICLE_COUNT,
+                OrbWidget.EXPANDED_PARTICLE_COUNT,
                 self.progress,
             )
         )
@@ -690,6 +696,7 @@ class GalaxyTransitionOverlay(QWidget):
             self.progress = self._animation_target
             if self.progress == 0.0:
                 self.timer.stop()
+                self.orb.timer.setInterval(24)
                 self.orb.particle_count = OrbWidget.BASE_PARTICLE_COUNT
                 self.orb.particle_size_scale = 1.0
                 self.orb.setParent(self.source_layout.parentWidget())

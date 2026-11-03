@@ -7,6 +7,7 @@ import wave
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -79,10 +80,12 @@ class VoiceWorkerTests(unittest.TestCase):
         self.assertEqual(list(app.pending_speech_messages), [])
 
     def test_message_to_user_tool_emits_progress_and_recovery_updates(self) -> None:
-        updates: list[str] = []
+        updates: list[tuple[str, str]] = []
         app = types.SimpleNamespace(
             signals=types.SimpleNamespace(
-                request_progress=types.SimpleNamespace(emit=updates.append)
+                agent_message=types.SimpleNamespace(
+                    emit=lambda message, kind: updates.append((message, kind))
+                )
             ),
             original_run_tool=Mock(),
         )
@@ -109,8 +112,8 @@ class VoiceWorkerTests(unittest.TestCase):
         self.assertEqual(
             updates,
             [
-                "진행 상황: 파일을 확인했고 테스트를 실행합니다.",
-                "오류 및 복구: API가 시간 초과되어 한 번 재시도합니다.",
+                ("파일을 확인했고 테스트를 실행합니다.", "progress"),
+                ("API가 시간 초과되어 한 번 재시도합니다.", "error"),
             ],
         )
         app.original_run_tool.assert_not_called()
@@ -153,6 +156,34 @@ class VoiceWorkerTests(unittest.TestCase):
                 {"message": "x" * 1201},
             ),
         )
+
+    def test_voice_server_startup_runs_on_a_background_thread(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        workers: list[threading.Thread] = []
+        original_thread = threading.Thread
+
+        def prepare_server() -> None:
+            started.set()
+            release.wait(timeout=2)
+
+        def create_thread(**kwargs: Any) -> threading.Thread:
+            worker = original_thread(**kwargs)
+            workers.append(worker)
+            return worker
+
+        app = types.SimpleNamespace(_prepare_voice_server=prepare_server)
+        with patch.object(Quasar.threading, "Thread", side_effect=create_thread):
+            Quasar.QuasarDesktopApp._start_voice_server(app)
+
+        try:
+            self.assertTrue(started.wait(timeout=1))
+            self.assertEqual(len(workers), 1)
+            self.assertTrue(workers[0].daemon)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(timeout=1)
 
     def test_capture_is_transcribed_locally_as_korean(self) -> None:
         captured: list[np.ndarray] = []

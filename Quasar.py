@@ -64,10 +64,12 @@ ACCENT = "#9b91ff"
 SYSTEM_PROMPT = (
     "You are Quasar. Respond concisely and accurately in the language the user uses, "
     "especially Korean or English. "
-    "Use message_to_user as a live status channel for multi-step work: announce a meaningful phase before a lengthy wait, "
-    "report completed milestones or changed plans, and immediately report tool failures with the cause and your recovery attempt. "
-    "After recovery, update the user and verify the outcome. Keep updates brief and actionable; avoid routine narration, duplicates, "
-    "and updates for simple questions or quick actions. Do not claim completion until verified. "
+    "Use message_to_user proactively as a live status channel. For multi-step work, send a brief progress update before the first lengthy operation, "
+    "then report each meaningful phase completion and the next step before another lengthy wait; do not wait until the final answer. "
+    "For several quick related actions, combine them into one update rather than narrating every tool call. "
+    "If a tool fails or blocks progress, immediately use kind='error' to state the observed cause and your concrete recovery attempt; "
+    "after recovery, report the outcome and continue verifying. Keep updates brief, factual, and actionable; avoid duplicates and routine narration "
+    "for simple questions or quick actions. Do not claim completion until verified. "
     "When the user asks to turn spoken responses on or off, use the set_tts_enabled tool. "
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
     "Run requested commands without showing confirmation dialogs. "
@@ -106,6 +108,7 @@ class AppSignals(QObject):
     request_failed = Signal(str)
     request_progress = Signal(str)
     agent_message = Signal(str, str)
+    alarm_triggered = Signal(str)
     models_loaded = Signal(str, object, object)
     voice_status = Signal(str)
     voice_text_ready = Signal(str)
@@ -1424,6 +1427,7 @@ class QuasarDesktopApp(QMainWindow):
         self.signals.request_failed.connect(self._finish_with_error)
         self.signals.request_progress.connect(self._show_request_progress)
         self.signals.agent_message.connect(self._show_agent_message)
+        self.signals.alarm_triggered.connect(self._show_alarm_notification)
         self.signals.models_loaded.connect(self._apply_model_options)
         self.signals.voice_status.connect(self._show_voice_status)
         self.signals.voice_text_ready.connect(self._submit_voice_text)
@@ -1442,6 +1446,10 @@ class QuasarDesktopApp(QMainWindow):
         self.client: Any = None
         self.model = ""
         self.startup_error: str | None = None
+        self.original_alarm_notification_callback = (
+            agent.alarm_notification_callback
+        )
+        self.alarm_notifications: list[QMessageBox] = []
         self._create_client(self.provider)
         self.original_run_tool = agent.run_tool
         self.tts_tool_schema = agent.tool_schema(
@@ -2029,42 +2037,51 @@ class QuasarDesktopApp(QMainWindow):
         self.office_monitor = None
         self.office_monitor_client = None
         self.office_monitor_source = None
-        monitor_stopped = True
         if monitor is not None:
             try:
                 monitor.set_enabled(False)
-                monitor_stopped = monitor.close()
             except Exception as error:
-                monitor_stopped = False
                 print(
                     f"Office 감시 종료 실패: {type(error).__name__}: {error}",
                     file=sys.stderr,
                     flush=True,
                 )
+            threading.Thread(
+                target=self._close_office_monitor_resources,
+                args=(monitor, client),
+                name="quasar-office-monitor-cleanup",
+                daemon=True,
+            ).start()
+            return
         if client is not None:
-            if monitor is not None and not monitor_stopped:
-                threading.Thread(
-                    target=self._close_office_client_after_monitor,
-                    args=(monitor, client),
-                    name="quasar-office-client-cleanup",
-                    daemon=True,
-                ).start()
-                return
-            try:
-                client.close()
-            except Exception as error:
-                print(
-                    f"Office 감시 연결 종료 실패: {type(error).__name__}: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            threading.Thread(
+                target=self._close_office_client,
+                args=(client,),
+                name="quasar-office-client-cleanup",
+                daemon=True,
+            ).start()
 
     @staticmethod
-    def _close_office_client_after_monitor(
+    def _close_office_monitor_resources(
         monitor: agent.CliCollaborationMonitor,
-        client: Any,
+        client: Any | None,
     ) -> None:
-        monitor.wait_until_closed()
+        try:
+            monitor_stopped = monitor.close()
+        except Exception as error:
+            monitor_stopped = False
+            print(
+                f"Office 감시 종료 실패: {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not monitor_stopped:
+            monitor.wait_until_closed()
+        if client is not None:
+            QuasarDesktopApp._close_office_client(client)
+
+    @staticmethod
+    def _close_office_client(client: Any) -> None:
         try:
             client.close()
         except Exception as error:
@@ -2296,6 +2313,8 @@ class QuasarDesktopApp(QMainWindow):
         agent.current_directory = Path(__file__).resolve().parent
         agent.auto_approve_commands = True
         agent.run_tool = self._run_tool
+        if hasattr(self, "signals"):
+            agent.alarm_notification_callback = self.signals.alarm_triggered.emit
         mcp_config_path = agent.resolve_mcp_config_path(
             None,
             agent.current_directory,
@@ -2525,11 +2544,7 @@ class QuasarDesktopApp(QMainWindow):
     def _start_voice_recording(self) -> None:
         if self.busy or self.voice_recording or self.voice_processing:
             return
-        try:
-            self.voice_recognizer.start_server()
-        except (OSError, RuntimeError) as error:
-            self._finish_voice_error(f"{type(error).__name__}: {error}")
-            return
+        self._start_voice_server()
         self.voice_recording = True
         self.voice_stop_event = threading.Event()
         self.voice_button.setText("듣는 중... 놓으면 전송")
@@ -2592,13 +2607,7 @@ class QuasarDesktopApp(QMainWindow):
             self.voice_conversation_listening = False
             return
         self.voice_conversation_retry_attempt = 0
-        try:
-            self.voice_recognizer.start_server()
-        except (OSError, RuntimeError) as error:
-            self._finish_voice_conversation_error(
-                f"{type(error).__name__}: {error}"
-            )
-            return
+        self._start_voice_server()
         self.galaxy_transition.set_conversation_status(
             "듣는 중... 편하게 말씀하시면 자동으로 전송합니다."
         )
@@ -2642,14 +2651,23 @@ class QuasarDesktopApp(QMainWindow):
             or self.busy
         ):
             return
+        self._start_voice_server()
+        self._start_voice_conversation_capture()
+
+    def _start_voice_server(self) -> None:
+        threading.Thread(
+            target=self._prepare_voice_server,
+            name="quasar-asr-startup",
+            daemon=True,
+        ).start()
+
+    def _prepare_voice_server(self) -> None:
         try:
             self.voice_recognizer.start_server()
         except (OSError, RuntimeError) as error:
-            self._finish_voice_conversation_error(
-                f"{type(error).__name__}: {error}"
+            self.signals.voice_status.emit(
+                f"음성 인식기 준비 실패: {type(error).__name__}: {error}"
             )
-            return
-        self._start_voice_conversation_capture()
 
     def _submit_voice_conversation_text(self, text: str) -> None:
         if self.closing or not self.voice_conversation_active:
@@ -2811,6 +2829,32 @@ class QuasarDesktopApp(QMainWindow):
             else message
         )
         self._add_message("assistant", content)
+
+    def _show_alarm_notification(self, message: str) -> None:
+        if self.closing:
+            return
+        self._add_message("assistant", f"🔔 알람: {message}")
+        self.status_label.setText(f"알람: {message}")
+
+        notification = QMessageBox(self)
+        notification.setIcon(QMessageBox.Icon.Information)
+        notification.setWindowTitle("Quasar 알람")
+        notification.setText(message)
+        notification.setStandardButtons(QMessageBox.StandardButton.Ok)
+        notification.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        notification.setWindowModality(Qt.WindowModality.NonModal)
+        notification.finished.connect(
+            lambda _result, dialog=notification: self._dismiss_alarm_notification(
+                dialog
+            )
+        )
+        self.alarm_notifications.append(notification)
+        notification.show()
+
+    def _dismiss_alarm_notification(self, notification: QMessageBox) -> None:
+        if notification in self.alarm_notifications:
+            self.alarm_notifications.remove(notification)
+        notification.deleteLater()
 
     def _finish_with_response(
         self,
@@ -3057,6 +3101,9 @@ class QuasarDesktopApp(QMainWindow):
             else:
                 self._close_mcp_manager(mcp_manager)
         agent.run_tool = self.original_run_tool
+        agent.alarm_notification_callback = (
+            self.original_alarm_notification_callback
+        )
         if self.tts_tool_schema in agent.TOOLS:
             agent.TOOLS.remove(self.tts_tool_schema)
         event.accept()
