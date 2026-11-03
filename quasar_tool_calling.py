@@ -14,7 +14,8 @@ MAX_TOOL_ROUNDS = 32
 CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     "code": (
         "코드",
-        "코드 탐색, Python 문법 검사, 실행, 코드 수정 도구입니다. 수정 전 반드시 읽고 "
+        "Python 파일 목록 조회·읽기, 문법 검사·실행, 코드 파일 생성·수정, 작업 폴더에서 명령 실행. "
+        "수정 전 반드시 읽고 "
         "정확한 기존 내용을 expected_source로 전달하세요. 실행 또는 시스템 명령은 승인 후에만 수행합니다.",
         frozenset({
             "python_list_files",
@@ -25,9 +26,23 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
             "execute_cmd",
         }),
     ),
+    "code_analysis": (
+        "코드 분석",
+        "Grep 정규식 검색, Glob 파일 선택, Python AST 함수·클래스 구조 보기, Git Diff 변경 부분 확인, "
+        "VS Code LSP로 정의·참조·호버/타입·진단 조회를 할 수 있습니다. "
+        "LSP 기능은 Quasar Live Analysis VS Code 확장 연결이 필요합니다.",
+        frozenset({
+            "grep",
+            "glob",
+            "python_ast_outline",
+            "git_diff",
+            "lsp_query",
+        }),
+    ),
     "files": (
         "파일",
-        "작업 폴더의 파일 탐색, 읽기, 검색 색인 및 수정 도구입니다. 작업 폴더 밖의 경로는 사용할 수 없습니다.",
+        "작업 폴더의 파일 탐색·읽기·수정, 문서 검색 색인·검색, VS Code에서 파일 열기. "
+        "작업 폴더 밖의 경로는 사용할 수 없습니다.",
         frozenset({
             "python_list_files",
             "python_read_file",
@@ -40,7 +55,8 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     ),
     "web": (
         "웹",
-        "공개 웹 검색과 Quasar 브라우저 조작 도구입니다. 페이지 조작 전 DOM을 확인하고 결과를 검증하세요.",
+        "공개 웹 검색, Chrome에서 페이지 열기·탭 전환·탐색, 페이지 클릭·입력·스크롤·키 입력, "
+        "화면 캡처. 페이지 조작 전 DOM을 확인하고 결과를 검증하세요.",
         frozenset({
             "web_search",
             "web_navigate",
@@ -57,7 +73,8 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     ),
     "email": (
         "이메일",
-        "Gmail 검색 및 초안 작성 도구입니다. 이메일 발송은 사용자가 명시적으로 요청하고 승인한 경우에만 수행하세요.",
+        "Gmail 열기·검색, 이메일 초안 작성·발송. 이메일 발송은 사용자가 명시적으로 요청하고 "
+        "승인한 경우에만 수행하세요.",
         frozenset({
             "gmail_open",
             "gmail_search",
@@ -67,7 +84,8 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     ),
     "calendar": (
         "일정·시간",
-        "현재 시각 조회, 일정 파일 생성, 알람·타이머 및 예약 명령 도구입니다. 예약 명령은 실행 전 승인이 필요합니다.",
+        "현재 시각 조회, 일정 파일 생성, 알람·타이머 설정, 명령 예약. "
+        "예약 명령은 실행 전 승인이 필요합니다.",
         frozenset({
             "get_current_time",
             "create_calendar_event",
@@ -78,7 +96,7 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     ),
     "tasks": (
         "할 일",
-        "공유 할 일 목록을 조회하고 추가·수정·삭제하는 도구입니다. 삭제는 실행 전 승인이 필요합니다.",
+        "공유 할 일 목록 조회, 항목 추가·수정·완료 처리·삭제. 삭제는 실행 전 승인이 필요합니다.",
         frozenset({
             "todo_list",
             "todo_add",
@@ -88,36 +106,53 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     ),
     "integrations": (
         "외부 연동",
-        "연결된 MCP 서버의 도구를 검색하고 사용하는 진입점입니다. 필요한 기능을 영어로 검색한 뒤 반환된 도구를 호출하세요.",
-        frozenset({"discover_mcp_tools"}),
+        "MCP 서버 목록 조회, 새 서버 추가·연결, 서버 제거·연결 종료, 연결된 서버의 외부 기능 검색 및 사용. "
+        "새 서버를 추가하거나 제거할 때는 사용자 승인을 받아야 합니다. "
+        "추가한 서버의 command/args/env 설정은 MCP 설정 파일에 저장됩니다.",
+        frozenset({
+            "list_mcp_servers",
+            "add_mcp_server",
+            "remove_mcp_server",
+            "discover_mcp_tools",
+        }),
     ),
 }
 
-CATEGORY_NAMES = tuple(CATEGORY_DETAILS)
-
-LIST_CATEGORIES_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "list_tool_categories",
-        "description": "List available tool categories and their short descriptions.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
+_CATEGORY_PURPOSES = {
+    "code": "코드를 작성할 때 사용하는 도구입니다.",
+    "code_analysis": "코드를 빠르게 탐색하고 구조와 변경 사항을 분석하는 도구입니다.",
+    "files": "작업 폴더의 파일과 문서를 다루는 도구입니다.",
+    "web": "웹을 탐색할 수 있는 도구입니다.",
+    "email": "이메일을 검색하고 작성하는 도구입니다.",
+    "calendar": "일정과 시간 관련 작업에 사용하는 도구입니다.",
+    "tasks": "할 일 목록을 관리하는 도구입니다.",
+    "integrations": "연결된 외부 서비스를 사용하는 도구입니다.",
 }
 
-LOAD_CATEGORIES_TOOL = {
+
+CATEGORY_SELECTION_TOOL = {
     "type": "function",
     "function": {
-        "name": "load_tool_categories",
+        "name": "select_tool_categories",
         "description": (
-            "Load one or more tool categories needed for the task. Already loaded "
-            "categories remain available; additional categories can be loaded later."
+            "요청을 수행하는 데 필요한 도구 카테고리를 하나 이상 선택합니다. "
+            "요청의 목표와 단계에 맞는 카테고리를 모두 골라 categories로 전달하세요. "
+            "선택한 카테고리의 도구가 제공되며, 작업 중 다른 카테고리가 필요하면 추가로 선택할 수 있습니다.\n"
+            "카테고리:\n"
+            + "\n".join(
+                f"- {category}: {_CATEGORY_PURPOSES[category]} 주요 기능: {details[1]}"
+                for category, details in CATEGORY_DETAILS.items()
+            )
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "categories": {
                     "type": "array",
-                    "items": {"type": "string", "enum": list(CATEGORY_NAMES)},
+                    "items": {
+                        "type": "string",
+                        "enum": list(CATEGORY_DETAILS),
+                    },
                     "minItems": 1,
                     "uniqueItems": True,
                 }
@@ -129,20 +164,13 @@ LOAD_CATEGORIES_TOOL = {
 
 
 def resolve_tool_calling_mode(configured_value: str | None = None) -> str:
-    value = configured_value or LEGACY_MODE
+    value = configured_value or DYNAMIC_MODE
     normalized = value.strip().lower()
     if normalized not in TOOL_CALLING_MODES:
         raise ValueError(
             "Tool calling mode must be 'legacy' or 'dynamic'."
         )
     return normalized
-
-
-def get_category_names() -> str:
-    return "\n".join(
-        f"- {name}: {details[0]} — {details[1]}"
-        for name, details in CATEGORY_DETAILS.items()
-    )
 
 
 def load_categories(
@@ -155,11 +183,11 @@ def load_categories(
         or not requested_categories
         or not all(isinstance(item, str) for item in requested_categories)
     ):
-        return "도구 카테고리 로드 실패: categories는 하나 이상의 카테고리 이름 목록이어야 합니다."
+        return "도구 카테고리 선택 실패: categories는 하나 이상의 카테고리 이름 목록이어야 합니다."
 
     unknown = sorted(set(requested_categories) - CATEGORY_DETAILS.keys())
     if unknown:
-        return f"도구 카테고리 로드 실패: 알 수 없는 카테고리: {', '.join(unknown)}"
+        return f"도구 카테고리 선택 실패: 알 수 없는 카테고리: {', '.join(unknown)}"
 
     newly_loaded = set(requested_categories) - loaded_categories
     loaded_categories.update(requested_categories)
@@ -173,16 +201,16 @@ def load_categories(
 
     sections = []
     for category in requested_categories:
-        title, instructions, tool_names = CATEGORY_DETAILS[category]
+        title, description, tool_names = CATEGORY_DETAILS[category]
         category_tools = sorted(tool_names & available_names)
         sections.append(
             f"{title} ({category})\n"
-            f"지침: {instructions}\n"
-            f"도구: {', '.join(category_tools) if category_tools else '현재 사용할 수 있는 도구 없음'}"
+            f"주요 기능: {_CATEGORY_PURPOSES[category]} {description}\n"
+            f"사용 가능한 도구: {', '.join(category_tools) if category_tools else '현재 사용할 수 있는 도구 없음'}"
         )
-    newly_loaded_names = ", ".join(sorted(newly_loaded)) or "없음 (이미 로드됨)"
+    newly_loaded_names = ", ".join(sorted(newly_loaded)) or "없음 (이미 선택됨)"
     return (
-        f"카테고리 로드 완료: {', '.join(requested_categories)}\n"
+        f"카테고리 도구 로드 완료: {', '.join(requested_categories)}\n"
         f"이번에 새로 로드됨: {newly_loaded_names}\n\n"
         + "\n\n".join(sections)
     )
@@ -199,7 +227,7 @@ def initial_tools(
         and isinstance(tool.get("function"), dict)
         and tool["function"].get("name") in dynamic_entry_names
     ]
-    return [LIST_CATEGORIES_TOOL, LOAD_CATEGORIES_TOOL, *available]
+    return [CATEGORY_SELECTION_TOOL, *available]
 
 
 def tools_for_categories(

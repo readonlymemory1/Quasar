@@ -143,6 +143,191 @@ function activate(context) {
         }
     }
 
+    let pollingLspRequest = false;
+
+    async function respondToLspRequest(endpoint, token, requestId, result, error) {
+        const responseUrl = new URL(endpoint);
+        responseUrl.pathname = "/lsp-response";
+        responseUrl.search = "";
+        responseUrl.hash = "";
+        const body = Buffer.from(JSON.stringify({
+            id: requestId,
+            result,
+            error: error || null,
+        }));
+        await new Promise((resolve, reject) => {
+            const request = http.request(responseUrl, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                    "Content-Length": body.length,
+                },
+                timeout: 5000,
+            }, (response) => {
+                response.resume();
+                response.on("end", () => {
+                    if (response.statusCode === 204) {
+                        resolve();
+                    } else {
+                        reject(new Error(`LSP response failed: HTTP ${response.statusCode}`));
+                    }
+                });
+            });
+            request.on("timeout", () => request.destroy(new Error("Request timed out")));
+            request.on("error", reject);
+            request.end(body);
+        });
+    }
+
+    function serializeLocation(location) {
+        const uri = location.uri || location.targetUri;
+        const range = location.range || location.targetSelectionRange || location.targetRange;
+        return {
+            path: uri ? uri.fsPath : null,
+            range: range ? {
+                start: {
+                    line: range.start.line + 1,
+                    character: range.start.character + 1,
+                },
+                end: {
+                    line: range.end.line + 1,
+                    character: range.end.character + 1,
+                },
+            } : null,
+        };
+    }
+
+    async function executeLspRequest(request) {
+        const document = await vscode.workspace.openTextDocument(request.path);
+        if (request.action === "diagnostics") {
+            return vscode.languages.getDiagnostics(document.uri).map((diagnostic) => ({
+                severity: vscode.DiagnosticSeverity[diagnostic.severity],
+                code: diagnostic.code || null,
+                message: diagnostic.message,
+                range: {
+                    start: {
+                        line: diagnostic.range.start.line + 1,
+                        character: diagnostic.range.start.character + 1,
+                    },
+                    end: {
+                        line: diagnostic.range.end.line + 1,
+                        character: diagnostic.range.end.character + 1,
+                    },
+                },
+            }));
+        }
+
+        const position = new vscode.Position(
+            Math.max(0, request.line - 1),
+            Math.max(0, request.character - 1),
+        );
+        if (request.action === "definition") {
+            const locations = await vscode.commands.executeCommand(
+                "vscode.executeDefinitionProvider",
+                document.uri,
+                position,
+            );
+            return (locations || []).map(serializeLocation);
+        }
+        if (request.action === "references") {
+            const locations = await vscode.commands.executeCommand(
+                "vscode.executeReferenceProvider",
+                document.uri,
+                position,
+                { includeDeclaration: request.include_declaration !== false },
+            );
+            return (locations || []).map(serializeLocation);
+        }
+        if (request.action === "hover") {
+            const hovers = await vscode.commands.executeCommand(
+                "vscode.executeHoverProvider",
+                document.uri,
+                position,
+            );
+            return (hovers || []).map((hover) => ({
+                contents: hover.contents.map((content) => {
+                    if (typeof content === "string") {
+                        return content;
+                    }
+                    return content.value || content.toString();
+                }),
+                range: hover.range ? {
+                    start: {
+                        line: hover.range.start.line + 1,
+                        character: hover.range.start.character + 1,
+                    },
+                    end: {
+                        line: hover.range.end.line + 1,
+                        character: hover.range.end.character + 1,
+                    },
+                } : null,
+            }));
+        }
+        throw new Error(`Unsupported LSP action: ${request.action}`);
+    }
+
+    async function pollLspRequest() {
+        if (!connected || pollingLspRequest) {
+            return;
+        }
+        pollingLspRequest = true;
+        try {
+            const endpoint = context.globalState.get(endpointKey);
+            const token = await context.secrets.get(tokenKey);
+            if (!endpoint || !token) {
+                return;
+            }
+            const requestUrl = new URL(endpoint);
+            requestUrl.pathname = "/lsp-request";
+            requestUrl.search = "";
+            requestUrl.hash = "";
+            const lspRequest = await new Promise((resolve, reject) => {
+                const request = http.request(requestUrl, {
+                    method: "GET",
+                    headers: { "Authorization": `Bearer ${token}` },
+                    timeout: 3000,
+                }, (response) => {
+                    let body = "";
+                    response.setEncoding("utf8");
+                    response.on("data", (chunk) => { body += chunk; });
+                    response.on("end", () => {
+                        if (response.statusCode === 204) {
+                            resolve(null);
+                        } else if (response.statusCode === 200) {
+                            try {
+                                resolve(JSON.parse(body));
+                            } catch (error) {
+                                reject(error);
+                            }
+                        } else {
+                            reject(new Error(`LSP request failed: HTTP ${response.statusCode}`));
+                        }
+                    });
+                });
+                request.on("timeout", () => request.destroy(new Error("Request timed out")));
+                request.on("error", reject);
+                request.end();
+            });
+            if (!lspRequest) {
+                return;
+            }
+            let result = null;
+            let error = null;
+            try {
+                result = await executeLspRequest(lspRequest);
+            } catch (requestError) {
+                error = requestError instanceof Error ? requestError.message : String(requestError);
+            }
+            await respondToLspRequest(endpoint, token, lspRequest.id, result, error);
+        } catch (error) {
+            status.text = "$(warning) Quasar: LSP 연결 오류";
+            status.tooltip = `VS Code LSP 요청 처리 실패: ${error.message}`;
+        } finally {
+            pollingLspRequest = false;
+        }
+    }
+
     async function sendDocument(document) {
         if (!connected || !document || document.languageId !== "python") {
             return;
@@ -221,10 +406,14 @@ function activate(context) {
     const editorUpdateTimer = setInterval(() => {
         void pollEditorUpdate();
     }, 1000);
+    const lspRequestTimer = setInterval(() => {
+        void pollLspRequest();
+    }, 250);
     context.subscriptions.push({
         dispose() {
             clearInterval(syncTimer);
             clearInterval(editorUpdateTimer);
+            clearInterval(lspRequestTimer);
         },
     });
 

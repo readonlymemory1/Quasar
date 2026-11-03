@@ -51,6 +51,55 @@ class OfficeMonitorGuiTests(unittest.TestCase):
 
         scrollbar.setValue.assert_called_once_with(420)
 
+    def test_radial_menu_close_finishes_after_reverse_animation(self) -> None:
+        timer = Mock()
+        overlay = Mock()
+        menu_button = Mock()
+        radial_button = Mock()
+        app = SimpleNamespace(
+            radial_animation_timer=timer,
+            radial_animation_progress=1.0,
+            radial_animation_from_progress=0.0,
+            radial_animation_to_progress=0.0,
+            radial_animation_opening=True,
+            radial_animation_started_at=10.0,
+            radial_animation_duration_ms=480,
+            radial_buttons=[radial_button],
+            control_overlay=overlay,
+            menu_button=menu_button,
+            _layout_radial_menu=Mock(),
+            _finish_radial_animation=lambda: (
+                Quasar.QuasarDesktopApp._finish_radial_animation(app)
+            ),
+        )
+
+        with patch(
+            "Quasar.time.perf_counter",
+            side_effect=(10.0, 10.5),
+        ):
+            Quasar.QuasarDesktopApp._start_radial_animation(app, False)
+            Quasar.QuasarDesktopApp._advance_radial_animation(app)
+
+        overlay.hide.assert_called_once_with()
+        menu_button.setText.assert_called_once_with("☰")
+        radial_button.setEnabled.assert_called_once_with(False)
+        app._layout_radial_menu.assert_called()
+        timer.stop.assert_called()
+
+    def test_radial_menu_origin_uses_left_orb_position(self) -> None:
+        orb = Mock()
+        orb.rect.return_value.center.return_value = "orb-center"
+        orb.mapToGlobal.return_value = "global-orb-center"
+        overlay = Mock()
+        overlay.mapFromGlobal.return_value = Quasar.QPointF(34, 82).toPoint()
+        app = SimpleNamespace(orb=orb, control_overlay=overlay)
+
+        origin = Quasar.QuasarDesktopApp._radial_menu_origin(app)
+
+        self.assertEqual(origin, Quasar.QPointF(34, 82))
+        orb.mapToGlobal.assert_called_once_with("orb-center")
+        overlay.mapFromGlobal.assert_called_once_with("global-orb-center")
+
     def test_request_progress_updates_status_without_creating_chat_bubble(self) -> None:
         app = SimpleNamespace(
             closing=False,
@@ -157,6 +206,7 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             1,
         )
         mcp_manager = Mock()
+        live_analysis_server = Mock()
         client = Mock()
         signals = SimpleNamespace(
             request_progress=Mock(),
@@ -164,7 +214,10 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             request_failed=Mock(),
             request_cancelled=Mock(),
         )
-        app = SimpleNamespace(signals=signals)
+        app = SimpleNamespace(
+            signals=signals,
+            live_analysis_server=live_analysis_server,
+        )
 
         with patch.object(
             Quasar.agent,
@@ -191,6 +244,10 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             "\n[연결 문서]\n중요한 사실",
         )
         self.assertIs(request_agent.call_args.kwargs["mcp_manager"], mcp_manager)
+        self.assertIs(
+            request_agent.call_args.kwargs["live_analysis_server"],
+            live_analysis_server,
+        )
         signals.response_ready.emit.assert_called_once_with(
             "답변",
             [{"role": "system", "content": "system prompt"}],

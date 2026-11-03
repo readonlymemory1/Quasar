@@ -24,8 +24,9 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 import quasar_cli as agent
-from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal
-from PySide6.QtGui import QIcon, QKeyEvent, QKeySequence, QShortcut
+from chat_history import ChatHistoryStore
+from PySide6.QtCore import QObject, QPointF, QSettings, QStandardPaths, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QKeyEvent, QKeySequence, QPainter, QPen, QShortcut
 from quasar_galaxy import (
     CANVAS_BACKGROUND_STOPS,
     BlackHoleOverlay,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QListWidget,
     QListWidgetItem,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -53,6 +55,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -70,7 +73,14 @@ SYSTEM_PROMPT = (
     "Use message_to_user proactively as a live status channel. For multi-step work, send a brief progress update before the first lengthy operation, "
     "then report each meaningful phase completion and the next step before another lengthy wait; do not wait until the final answer. "
     "For several quick related actions, combine them into one update rather than narrating every tool call. "
+    "Command execution waits until the process exits and returns its output and exit code; inspect the result before reporting completion or starting a dependent command. "
     "If a tool fails or blocks progress, immediately use kind='error' to state the observed cause and your concrete recovery attempt; "
+    "never infer that Node.js or npx is missing from an MCP failure alone. Before recommending installation or a restart, "
+    "verify node --version and npx --version in the same environment and report their actual results; otherwise state the exact MCP error "
+    "and distinguish confirmed facts from possible causes. A WinError 2 only establishes that the configured executable could not be resolved "
+    "for that process launch; it does not by itself prove Node.js is absent or that PATH is stale. Never recommend rebooting or restarting the IDE/app "
+    "as a generic fix. Inspect the MCP server status and exact configuration, then test node --version and npx --version in this process environment "
+    "before proposing a cause or remedy. "
     "after recovery, report the outcome and continue verifying. Keep updates brief, factual, and actionable; avoid duplicates and routine narration "
     "for simple questions or quick actions. Do not claim completion until verified. "
     "When the user asks to turn spoken responses on or off, use the set_tts_enabled tool. "
@@ -162,6 +172,93 @@ class VoicePushButton(QPushButton):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+
+class RadialMenuOverlay(QWidget):
+    dismissed = Signal()
+
+    def mousePressEvent(self, event: Any) -> None:
+        self.dismissed.emit()
+        event.accept()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.dismissed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class RadialStarburstOverlay(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.progress = 0.0
+        self.origin = QPointF()
+        self.targets: list[QPointF] = []
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def set_animation_state(
+        self,
+        progress: float,
+        origin: QPointF,
+        targets: list[QPointF],
+    ) -> None:
+        self.progress = max(0.0, min(1.0, progress))
+        self.origin = origin
+        self.targets = targets
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        if not self.targets or self.progress <= 0.0 or self.progress >= 1.0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for index, target in enumerate(self.targets):
+            delay = (index % 4) * 0.055
+            progress = max(0.0, min(1.0, (self.progress - delay) / (1 - delay)))
+            if progress <= 0.0 or progress >= 1.0:
+                continue
+            for particle_index in range(3):
+                offset = (particle_index - 1) * 0.11
+                particle_progress = max(
+                    0.0,
+                    min(1.0, progress - offset),
+                )
+                particle_eased = particle_progress * particle_progress * (
+                    3 - 2 * particle_progress
+                )
+                point = QPointF(
+                    self.origin.x()
+                    + (target.x() - self.origin.x()) * particle_eased,
+                    self.origin.y()
+                    + (target.y() - self.origin.y()) * particle_eased,
+                )
+                alpha = int(235 * (1 - abs(particle_progress - 0.52) * 1.6))
+                if alpha <= 0:
+                    continue
+                color = QColor(176, 203, 255, min(255, alpha))
+                painter.setPen(QPen(color, 1.2, Qt.PenStyle.SolidLine))
+                radius = 2.2 if particle_index == 1 else 1.35
+                painter.drawLine(
+                    QPointF(point.x() - radius, point.y()),
+                    QPointF(point.x() + radius, point.y()),
+                )
+                painter.drawLine(
+                    QPointF(point.x(), point.y() - radius),
+                    QPointF(point.x(), point.y() + radius),
+                )
+
+        galaxy_alpha = int(215 * (1 - self.progress))
+        if galaxy_alpha > 0:
+            painter.setPen(QPen(QColor(160, 173, 255, galaxy_alpha), 1.4))
+            painter.drawEllipse(
+                self.origin,
+                13 + 15 * self.progress,
+                5 + 6 * self.progress,
+            )
+            painter.setPen(QPen(QColor(226, 232, 255, galaxy_alpha), 2.0))
+            painter.drawPoint(self.origin)
 
 
 class MicrophoneSettingsDialog(QDialog):
@@ -1426,6 +1523,22 @@ class QuasarDesktopApp(QMainWindow):
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         self.settings = QSettings("Quasar", "Quasar")
+        self.chat_history_store: ChatHistoryStore | None = None
+        self.chat_history_error: str | None = None
+        self.current_chat_id: str | None = None
+        self.temporary_chat = False
+        self.suspended_chat: tuple[str | None, list[dict[str, Any]]] | None = None
+        history_directory = Path(
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.AppDataLocation
+            )
+        )
+        try:
+            self.chat_history_store = ChatHistoryStore(
+                history_directory / "chat_history.sqlite3"
+            )
+        except (OSError, sqlite3.Error) as error:
+            self.chat_history_error = str(error)
         self.tool_rounds_error: str | None = None
         try:
             self.max_tool_rounds = agent.get_max_tool_rounds(
@@ -1447,6 +1560,8 @@ class QuasarDesktopApp(QMainWindow):
         self.office_monitor_source: _OfficeDocumentSource | None = None
         self.mcp_manager: agent.MCPServerManager | None = None
         self.mcp_startup_error: str | None = None
+        self.live_analysis_server: agent.CliLiveAnalysisServer | None = None
+        self.live_analysis_server_error: str | None = None
         self.microphone_notice: str | None = None
         self.microphone_device_index = self._restore_microphone_selection()
         self.busy = False
@@ -1530,8 +1645,8 @@ class QuasarDesktopApp(QMainWindow):
         top_bar = QFrame()
         top_bar.setObjectName("topBar")
         header = QHBoxLayout(top_bar)
-        header.setContentsMargins(18, 14, 16, 14)
-        header.setSpacing(10)
+        header.setContentsMargins(10, 7, 10, 7)
+        header.setSpacing(12)
 
         brand_mark = QFrame()
         brand_mark.setObjectName("brandMark")
@@ -1544,55 +1659,49 @@ class QuasarDesktopApp(QMainWindow):
         mark_layout.addWidget(mark)
         header.addWidget(brand_mark)
 
-        brand_copy = QVBoxLayout()
-        brand_copy.setSpacing(1)
-        title = QLabel("Quasar")
-        title.setStyleSheet("font-size: 19px; font-weight: 750;")
-        subtitle = QLabel("개인 AI 워크스페이스")
-        subtitle.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        brand_copy.addWidget(title)
-        brand_copy.addWidget(subtitle)
-        header.addLayout(brand_copy)
-        header.addStretch(1)
+        self.menu_button = QToolButton()
+        self.menu_button.setText("☰")
+        self.menu_button.setFixedSize(46, 46)
+        self.menu_button.setToolTip("Quasar 메뉴")
+        self.menu_button.setAccessibleName("Quasar 메뉴 열기")
+        self.menu_button.setStyleSheet(
+            "QToolButton { font-size: 23px; font-weight: 700; padding: 0; }"
+        )
+        self.menu_button.clicked.connect(self._toggle_radial_menu)
 
         self.provider_selector = QComboBox()
         self.provider_selector.addItems(("ollama", "openai"))
         self.provider_selector.setCurrentText(self.provider)
         self.provider_selector.currentTextChanged.connect(self._change_provider)
         self.provider_selector.setToolTip("AI 공급자 선택")
-        self.provider_selector.setMinimumWidth(108)
+        self.provider_selector.setMinimumWidth(0)
+        self.provider_selector.setFixedSize(112, 40)
         header.addWidget(self.provider_selector)
 
         self.model_selector = QComboBox()
         self.model_selector.setEditable(True)
         self.model_selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.model_selector.setMinimumWidth(210)
+        self.model_selector.setMinimumWidth(160)
+        self.model_selector.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.model_selector.setFixedHeight(40)
         self.model_selector.setEditText(self.model)
         self.model_selector.setToolTip("모델 선택 또는 모델 이름 직접 입력")
         self.model_selector.currentTextChanged.connect(self._remember_model)
-        header.addWidget(self.model_selector)
+        header.addWidget(self.model_selector, 1)
+        header.addWidget(self.menu_button)
 
         self.refresh_models_button = QPushButton("모델 새로고침")
         self.refresh_models_button.setMinimumHeight(40)
         self.refresh_models_button.clicked.connect(self._load_model_options)
-        header.addWidget(self.refresh_models_button)
 
-        self.settings_button = QPushButton("설정")
-        self.settings_button.setMinimumHeight(40)
-        self.settings_button.clicked.connect(self._open_settings)
-        header.addWidget(self.settings_button)
-        self.office_watch_button = QPushButton("문서 감시")
-        self.office_watch_button.setMinimumHeight(40)
-        self.office_watch_button.clicked.connect(self._open_office_watch_dialog)
-        self.office_watch_button.setToolTip(
-            "저장된 Word/PPT/메모장 텍스트 파일을 공동작업 목록에 등록합니다."
-        )
-        header.addWidget(self.office_watch_button)
         self.checklist_button = QPushButton("체크리스트 열기")
         self.checklist_button.setMinimumHeight(40)
         self.checklist_button.setCheckable(True)
         self.checklist_button.toggled.connect(self._set_checklist_visible)
-        header.addWidget(self.checklist_button)
+        self.checklist_button.hide()
         layout.addWidget(top_bar)
 
         self.status_label = QLabel()
@@ -1764,6 +1873,93 @@ class QuasarDesktopApp(QMainWindow):
         self.galaxy_transition.expanded_changed.connect(
             self._set_voice_conversation_active
         )
+        self.control_overlay = RadialMenuOverlay(central)
+        self.control_overlay.setObjectName("radialControlOverlay")
+        self.control_overlay.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.control_overlay.setStyleSheet(
+            "QWidget#radialControlOverlay { background: rgba(3, 5, 14, 205); }"
+        )
+        self.control_overlay.dismissed.connect(self._close_radial_menu)
+        self.control_ring = QFrame(self.control_overlay)
+        self.control_ring.setObjectName("controlRing")
+        self.control_ring.setStyleSheet(
+            "QFrame#controlRing {"
+            "background: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.72,"
+            "stop: 0 #11182a, stop: 0.68 #11182a, stop: 1 #242343);"
+            "border: 1px solid #44406e; border-radius: 260px; }"
+        )
+        self.control_core = QFrame(self.control_ring)
+        self.control_core.setObjectName("controlCore")
+        self.control_core.setStyleSheet(
+            "QFrame#controlCore { background: #090d1c; border: 1px solid #303957;"
+            "border-radius: 120px; }"
+        )
+        core_layout = QVBoxLayout(self.control_core)
+        core_layout.setContentsMargins(24, 20, 24, 20)
+        core_layout.setSpacing(8)
+        self.control_core_title = QLabel("QUASAR")
+        self.control_core_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.control_core_title.setStyleSheet(
+            f"color: {ACCENT}; font-size: 14px; font-weight: 800; letter-spacing: 2px;"
+        )
+        core_layout.addWidget(self.control_core_title)
+        self.control_core_close_button: QToolButton | None = None
+        self.radial_buttons: list[QToolButton] = []
+        radial_actions = (
+            ("새 채팅", self._start_new_chat),
+            ("최근 채팅", self._open_recent_chats),
+            ("임시 채팅", self._toggle_temporary_chat),
+            ("모델 갱신", self._load_model_options),
+            ("설정", self._open_settings),
+            ("LSP 연결", self._show_lsp_connection),
+            ("문서 감시", self._open_office_watch_dialog),
+            ("체크리스트", self.checklist_button.toggle),
+        )
+        self.temporary_chat_button: QToolButton | None = None
+        self.model_refresh_radial_button: QToolButton | None = None
+        for label, callback in radial_actions:
+            button = QToolButton(self.control_overlay)
+            button.setText(label)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            button.setFixedSize(108, 46)
+            button.setStyleSheet(
+                "QToolButton { background: #222541; border: 1px solid #39375f;"
+                "border-radius: 15px; color: #e7eaff; font-weight: 650; }"
+                "QToolButton:hover { background: #37345f; border-color: #9b91ff; }"
+            )
+            button.clicked.connect(self._close_radial_menu)
+            button.clicked.connect(callback)
+            self.radial_buttons.append(button)
+            if label == "임시 채팅":
+                self.temporary_chat_button = button
+            elif label == "모델 갱신":
+                self.model_refresh_radial_button = button
+        close_button = QToolButton(self.control_core)
+        close_button.setText("닫기")
+        close_button.setFixedHeight(28)
+        close_button.setStyleSheet(
+            "QToolButton { color: #a9a7c8; background: transparent; border: 0; }"
+            "QToolButton:hover { color: #ffffff; }"
+        )
+        close_button.clicked.connect(self._close_radial_menu)
+        core_layout.addWidget(close_button)
+        self.control_core_close_button = close_button
+        self.radial_starburst = RadialStarburstOverlay(self.control_overlay)
+        self.radial_starburst.raise_()
+        self.radial_animation_progress = 0.0
+        self.radial_animation_from_progress = 0.0
+        self.radial_animation_to_progress = 0.0
+        self.radial_animation_opening = True
+        self.radial_animation_started_at = 0.0
+        self.radial_animation_duration_ms = 480
+        self.radial_animation_timer = QTimer(self)
+        self.radial_animation_timer.setInterval(16)
+        self.radial_animation_timer.timeout.connect(
+            self._advance_radial_animation
+        )
+        self.control_overlay.hide()
+        self._layout_radial_menu()
+        top_bar.setFixedHeight(60)
         self.voice_interrupt_shortcut = QShortcut(
             QKeySequence("Ctrl+Space"),
             self,
@@ -1787,7 +1983,122 @@ class QuasarDesktopApp(QMainWindow):
             self.black_hole_overlay.setGeometry(self.centralWidget().rect())
         if hasattr(self, "galaxy_transition"):
             self.galaxy_transition.setGeometry(self.centralWidget().rect())
+        if hasattr(self, "control_overlay"):
+            self._layout_radial_menu()
 
+    def _radial_menu_origin(self) -> QPointF:
+        orb_center = self.orb.mapToGlobal(self.orb.rect().center())
+        overlay_position = self.control_overlay.mapFromGlobal(orb_center)
+        return QPointF(overlay_position)
+
+    def _layout_radial_menu(self) -> None:
+        central = self.centralWidget()
+        if central is None or not hasattr(self, "control_overlay"):
+            return
+        bounds = central.rect()
+        self.control_overlay.setGeometry(bounds)
+        self.radial_starburst.setGeometry(bounds)
+        backdrop_alpha = round(100 * self.radial_animation_progress)
+        self.control_overlay.setStyleSheet(
+            "QWidget#radialControlOverlay {"
+            f"background: rgba(3, 5, 14, {backdrop_alpha});"
+            "}"
+        )
+        diameter = max(420, min(620, min(bounds.width(), bounds.height()) - 48))
+        ring_x = (bounds.width() - diameter) // 2
+        ring_y = (bounds.height() - diameter) // 2
+        self.control_ring.setGeometry(ring_x, ring_y, diameter, diameter)
+
+        core_size = round(diameter * 0.46)
+        core_x = (diameter - core_size) // 2
+        core_y = (diameter - core_size) // 2
+        self.control_core.setGeometry(core_x, core_y, core_size, core_size)
+        self.control_ring.setStyleSheet(
+            "QFrame#controlRing {"
+            "background: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.72,"
+            f"stop: 0 rgba(17, 24, 42, {round(255 * self.radial_animation_progress)}), "
+            f"stop: 0.68 rgba(17, 24, 42, {round(255 * self.radial_animation_progress)}), "
+            f"stop: 1 rgba(36, 35, 67, {round(255 * self.radial_animation_progress)}));"
+            f"border: 1px solid rgba(68, 64, 110, "
+            f"{round(255 * self.radial_animation_progress)});"
+            f"border-radius: {diameter // 2}px;"
+            "}"
+        )
+        core_alpha = round(255 * self.radial_animation_progress)
+        self.control_core.setStyleSheet(
+            "QFrame#controlCore { "
+            f"background: rgba(9, 13, 28, {core_alpha}); "
+            f"border: 1px solid rgba(48, 57, 87, {core_alpha});"
+            f"border-radius: {core_size // 2}px;"
+            "}"
+        )
+        self.control_core_title.setStyleSheet(
+            "font-size: 14px; font-weight: 800; letter-spacing: 2px;"
+            f"color: rgba(155, 145, 255, {core_alpha});"
+        )
+        if self.control_core_close_button is not None:
+            self.control_core_close_button.setStyleSheet(
+                "QToolButton { "
+                f"color: rgba(169, 167, 200, {core_alpha}); "
+                "background: transparent; border: 0; }"
+                "QToolButton:hover { color: #ffffff; }"
+            )
+        center = diameter / 2
+        origin = self._radial_menu_origin()
+        radius = diameter * 0.365
+        button_width = self.radial_buttons[0].width()
+        button_height = self.radial_buttons[0].height()
+        targets = []
+        for index, button in enumerate(self.radial_buttons):
+            angle = math.radians(-90 + index * 45)
+            button_x = round(
+                center + radius * math.cos(angle) - button_width / 2
+            )
+            button_y = round(
+                center + radius * math.sin(angle) - button_height / 2
+            )
+            targets.append(
+                QPointF(
+                    ring_x + button_x + button_width / 2,
+                    ring_y + button_y + button_height / 2,
+                )
+            )
+            delay = (index % 4) * 0.055
+            button_progress = max(
+                0.0,
+                min(
+                    1.0,
+                    (self.radial_animation_progress - delay) / (1 - delay),
+                ),
+            )
+            eased_progress = button_progress * button_progress * (
+                3 - 2 * button_progress
+            )
+            current_x = round(
+                origin.x()
+                + (ring_x + button_x - origin.x()) * eased_progress
+            )
+            current_y = round(
+                origin.y()
+                + (ring_y + button_y - origin.y()) * eased_progress
+            )
+            button.move(current_x, current_y)
+            button_alpha = round(255 * eased_progress)
+            button.setStyleSheet(
+                "QToolButton { "
+                f"background: rgba(34, 37, 65, {button_alpha}); "
+                f"border: 1px solid rgba(57, 55, 95, {button_alpha}); "
+                "border-radius: 15px; "
+                f"color: rgba(231, 234, 255, {button_alpha}); "
+                "font-weight: 650; }"
+                "QToolButton:hover { background: rgba(55, 52, 95, 255); "
+                "border-color: #9b91ff; }"
+            )
+        self.radial_starburst.set_animation_state(
+            self.radial_animation_progress,
+            origin,
+            targets,
+        )
     def _create_client(self, provider: str) -> None:
         try:
             self.client, self.model = agent.create_client(provider)
@@ -1809,6 +2120,8 @@ class QuasarDesktopApp(QMainWindow):
         self.model_selector.setEditText(self.model)
         self.model_selector.blockSignals(False)
         self.refresh_models_button.setEnabled(self.client is not None)
+        if self.model_refresh_radial_button is not None:
+            self.model_refresh_radial_button.setEnabled(self.client is not None)
         self._refresh_status()
         if office_monitor_was_enabled:
             self.status_label.setText(
@@ -1996,6 +2309,8 @@ class QuasarDesktopApp(QMainWindow):
         if self.client is None or self.busy:
             return
         self.refresh_models_button.setEnabled(False)
+        if self.model_refresh_radial_button is not None:
+            self.model_refresh_radial_button.setEnabled(False)
         self.status_label.setText(f"{self.provider.upper()} 모델 목록을 불러오는 중...")
         loader = ModelLoader(
             self.provider,
@@ -2024,6 +2339,8 @@ class QuasarDesktopApp(QMainWindow):
         self.model_selector.setEditText(current_model)
         self.model_selector.blockSignals(False)
         self.refresh_models_button.setEnabled(True)
+        if self.model_refresh_radial_button is not None:
+            self.model_refresh_radial_button.setEnabled(True)
         if errors:
             status = (
                 f"모델 목록을 모두 불러오지 못했습니다. 이름을 직접 입력할 수 있습니다. "
@@ -2043,19 +2360,61 @@ class QuasarDesktopApp(QMainWindow):
         elif self.client is not None:
             status = f"{self.provider.upper()} · {self.model or '모델을 선택하세요'}"
         else:
-            return
+            status = ""
         if self.microphone_notice:
-            status = f"{status} · {self.microphone_notice}"
+            status = f"{status} · {self.microphone_notice}" if status else self.microphone_notice
         if self.mcp_startup_error:
-            status = f"{status} · {self.mcp_startup_error}"
+            status = f"{status} · {self.mcp_startup_error}" if status else self.mcp_startup_error
         if self.tool_rounds_error:
-            status = (
-                f"{status} · 도구 반복 한도 설정 오류: {self.tool_rounds_error} "
+            status_message = (
+                f"도구 반복 한도 설정 오류: {self.tool_rounds_error} "
                 f"(기본값 {self.max_tool_rounds} 사용)"
             )
+            status = f"{status} · {status_message}" if status else status_message
         if self.tool_calling_mode_error:
-            status = f"{status} · 도구 호출 방식 설정 오류: {self.tool_calling_mode_error}"
-        self.status_label.setText(status)
+            status_message = f"도구 호출 방식 설정 오류: {self.tool_calling_mode_error}"
+            status = f"{status} · {status_message}" if status else status_message
+        if self.chat_history_error:
+            status_message = f"채팅 기록 저장 오류: {self.chat_history_error}"
+            status = f"{status} · {status_message}" if status else status_message
+        if self.live_analysis_server_error:
+            status_message = f"VS Code LSP 서버 오류: {self.live_analysis_server_error}"
+            status = f"{status} · {status_message}" if status else status_message
+        if status:
+            self.status_label.setText(status)
+
+    def _show_lsp_connection(self) -> None:
+        if self.live_analysis_server is None:
+            QMessageBox.warning(
+                self,
+                "VS Code LSP 연결",
+                f"로컬 LSP 서버를 사용할 수 없습니다: "
+                f"{self.live_analysis_server_error or '알 수 없는 오류'}",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("VS Code LSP 연결")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel(
+                "VS Code에서 'Quasar: Connect Live Analysis'를 실행한 뒤 "
+                "아래 Endpoint와 Token을 입력하세요."
+            )
+        )
+        form = QFormLayout()
+        endpoint = QLineEdit(self.live_analysis_server.endpoint)
+        endpoint.setReadOnly(True)
+        token = QLineEdit(self.live_analysis_server.token)
+        token.setReadOnly(True)
+        form.addRow("Endpoint", endpoint)
+        form.addRow("Token", token)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(560, 150)
+        dialog.exec()
 
     def _ensure_office_monitor(self) -> agent.CliCollaborationMonitor:
         if self.office_monitor is not None:
@@ -2359,6 +2718,260 @@ class QuasarDesktopApp(QMainWindow):
             elif item.widget() is not None:
                 item.widget().deleteLater()
 
+    def _save_chat_history(
+        self,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if self.temporary_chat or self.chat_history_store is None:
+            return
+        messages_to_save = messages if messages is not None else self.messages
+        if not any(
+            message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            for message in messages_to_save
+        ):
+            return
+        try:
+            self.current_chat_id = self.chat_history_store.save(
+                self.current_chat_id,
+                messages_to_save,
+            )
+            self.chat_history_error = None
+        except (OSError, sqlite3.Error, ValueError) as error:
+            self.chat_history_error = str(error)
+            self.status_label.setText(f"채팅 기록 저장 오류: {error}")
+
+    def _update_chat_mode_ui(self) -> None:
+        self.control_core_title.setText(
+            "임시 채팅" if self.temporary_chat else "QUASAR"
+        )
+        if self.temporary_chat_button is not None:
+            self.temporary_chat_button.setText(
+                "임시 종료" if self.temporary_chat else "임시 채팅"
+            )
+
+    def _toggle_radial_menu(self) -> None:
+        if self.control_overlay.isVisible():
+            self._close_radial_menu()
+            return
+        self._layout_radial_menu()
+        self.control_overlay.show()
+        self.control_overlay.raise_()
+        self.menu_button.setText("×")
+        self.menu_button.setAccessibleName("Quasar 메뉴 닫기")
+        self.control_overlay.setFocus()
+        self._start_radial_animation(True)
+
+    def _close_radial_menu(self) -> None:
+        if (
+            not hasattr(self, "control_overlay")
+            or not self.control_overlay.isVisible()
+        ):
+            return
+        self._start_radial_animation(False)
+
+    def _start_radial_animation(self, opening: bool) -> None:
+        self.radial_animation_timer.stop()
+        self.radial_animation_from_progress = self.radial_animation_progress
+        self.radial_animation_to_progress = 1.0 if opening else 0.0
+        self.radial_animation_opening = opening
+        self.radial_animation_started_at = time.perf_counter()
+        distance = abs(
+            self.radial_animation_to_progress
+            - self.radial_animation_from_progress
+        )
+        self.radial_animation_duration_ms = max(120, round(480 * distance))
+        for button in self.radial_buttons:
+            button.setEnabled(False)
+        if distance == 0:
+            self._finish_radial_animation()
+            return
+        self.radial_animation_timer.start()
+
+    def _advance_radial_animation(self) -> None:
+        elapsed_ms = (time.perf_counter() - self.radial_animation_started_at) * 1000
+        progress = min(1.0, elapsed_ms / self.radial_animation_duration_ms)
+        eased = progress * progress * (3 - 2 * progress)
+        self.radial_animation_progress = (
+            self.radial_animation_from_progress
+            + (
+                self.radial_animation_to_progress
+                - self.radial_animation_from_progress
+            )
+            * eased
+        )
+        self._layout_radial_menu()
+        if progress >= 1.0:
+            self._finish_radial_animation()
+
+    def _finish_radial_animation(self) -> None:
+        self.radial_animation_timer.stop()
+        self.radial_animation_progress = self.radial_animation_to_progress
+        self._layout_radial_menu()
+        if self.radial_animation_opening:
+            for button in self.radial_buttons:
+                button.setEnabled(True)
+        else:
+            self.control_overlay.hide()
+            self.menu_button.setText("☰")
+            self.menu_button.setAccessibleName("Quasar 메뉴 열기")
+
+    def _start_new_chat(self) -> None:
+        if self.busy:
+            QMessageBox.information(
+                self,
+                "새 채팅",
+                "응답이 끝난 뒤 새 채팅을 시작해 주세요.",
+            )
+            return
+        if self.temporary_chat:
+            QMessageBox.information(
+                self,
+                "새 채팅",
+                "임시 채팅을 종료한 뒤 새 채팅을 시작해 주세요.",
+            )
+            return
+        self._save_chat_history()
+        self.current_chat_id = None
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._clear_chat_view()
+        self.status_label.setText("새 채팅을 시작했습니다.")
+
+    def _toggle_temporary_chat(self) -> None:
+        if self.busy:
+            QMessageBox.information(
+                self,
+                "임시 채팅",
+                "응답이 끝난 뒤 임시 채팅을 전환해 주세요.",
+            )
+            return
+        if not self.temporary_chat:
+            self._save_chat_history()
+            self.suspended_chat = (self.current_chat_id, list(self.messages))
+            self.current_chat_id = None
+            self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self.temporary_chat = True
+            self._clear_chat_view()
+            self._update_chat_mode_ui()
+            self.status_label.setText(
+                "임시 채팅입니다. 이 대화는 저장되지 않습니다."
+            )
+            return
+
+        self.temporary_chat = False
+        if self.suspended_chat is None:
+            self.current_chat_id = None
+            self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        else:
+            self.current_chat_id, self.messages = self.suspended_chat
+        self.suspended_chat = None
+        self._clear_chat_view()
+        for message in self.messages:
+            if message.get("role") in {"user", "assistant"}:
+                self._add_message(message["role"], message["content"])
+        self._update_chat_mode_ui()
+        self.status_label.setText("이전 채팅으로 돌아왔습니다.")
+
+    def _open_recent_chats(self) -> None:
+        if self.busy:
+            QMessageBox.information(
+                self,
+                "최근 채팅",
+                "응답이 끝난 뒤 최근 채팅을 열어 주세요.",
+            )
+            return
+        if self.chat_history_store is None:
+            QMessageBox.warning(
+                self,
+                "최근 채팅",
+                f"채팅 기록 저장소를 사용할 수 없습니다: "
+                f"{self.chat_history_error or '알 수 없는 오류'}",
+            )
+            return
+        if self.temporary_chat:
+            answer = QMessageBox.question(
+                self,
+                "임시 채팅 종료",
+                "최근 채팅을 열면 현재 임시 대화는 저장하지 않고 종료됩니다. 계속할까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._toggle_temporary_chat()
+
+        try:
+            conversations = self.chat_history_store.list_recent()
+        except (OSError, sqlite3.Error, ValueError) as error:
+            self.chat_history_error = str(error)
+            QMessageBox.warning(
+                self,
+                "최근 채팅",
+                f"최근 채팅을 불러오지 못했습니다: {error}",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("최근 채팅")
+        layout = QVBoxLayout(dialog)
+        chat_list = QListWidget()
+        for conversation in conversations:
+            updated_at = conversation["updated_at"][:16].replace("T", " ")
+            item = QListWidgetItem(
+                f"{conversation['title']}\n{updated_at}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, conversation["id"])
+            chat_list.addItem(item)
+        layout.addWidget(chat_list)
+        buttons = QHBoxLayout()
+        open_button = QPushButton("열기")
+        open_button.setEnabled(bool(conversations))
+        close_button = QPushButton("닫기")
+        buttons.addStretch(1)
+        buttons.addWidget(open_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        open_button.clicked.connect(dialog.accept)
+        close_button.clicked.connect(dialog.reject)
+        chat_list.itemDoubleClicked.connect(dialog.accept)
+        dialog.resize(440, 520)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_item = chat_list.currentItem()
+        if selected_item is not None:
+            self._load_recent_chat(selected_item.data(Qt.ItemDataRole.UserRole))
+
+    def _load_recent_chat(self, chat_id: str) -> None:
+        if self.chat_history_store is None:
+            return
+        self._save_chat_history()
+        try:
+            conversation = self.chat_history_store.get(chat_id)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            self.chat_history_error = str(error)
+            QMessageBox.warning(
+                self,
+                "최근 채팅",
+                f"채팅을 불러오지 못했습니다: {error}",
+            )
+            return
+        if conversation is None:
+            QMessageBox.warning(
+                self,
+                "최근 채팅",
+                "선택한 채팅 기록을 찾을 수 없습니다.",
+            )
+            return
+        self.current_chat_id = chat_id
+        self.messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *conversation["messages"],
+        ]
+        self._clear_chat_view()
+        for message in conversation["messages"]:
+            self._add_message(message["role"], message["content"])
+        self.status_label.setText(f"채팅을 열었습니다: {conversation['title']}")
+
     def _run_chat_command(self, command: str) -> str:
         monitor = None
         command_name = command.strip().split(maxsplit=1)[0].lower()
@@ -2382,6 +2995,7 @@ class QuasarDesktopApp(QMainWindow):
         result = "\n".join(output).strip()
         if command.strip().lower() == "/clear":
             self._clear_chat_view()
+            self.current_chat_id = None
         return result or "명령을 실행했습니다."
 
     def _configure_agent(self) -> None:
@@ -2389,6 +3003,12 @@ class QuasarDesktopApp(QMainWindow):
         agent.auto_approve_commands = True
         agent.run_tool = self._run_tool
         agent.tool_approval_callback = self._request_tool_approval
+        try:
+            self.live_analysis_server = agent.CliLiveAnalysisServer(
+                agent.current_directory
+            )
+        except OSError as error:
+            self.live_analysis_server_error = str(error)
         if hasattr(self, "signals"):
             agent.alarm_notification_callback = self.signals.alarm_triggered.emit
         mcp_config_path = agent.resolve_mcp_config_path(
@@ -2457,6 +3077,13 @@ class QuasarDesktopApp(QMainWindow):
             message, kind = agent.validate_user_message(arguments)
             self.signals.agent_message.emit(message, kind)
             return "메시지를 사용자 채팅에 표시했습니다."
+        if name == "execute_cmd":
+            return self.original_run_tool(
+                name,
+                arguments,
+                live_analysis_server,
+                mcp_manager,
+            )
         return self.original_run_tool(
             name,
             arguments,
@@ -2477,6 +3104,8 @@ class QuasarDesktopApp(QMainWindow):
             return
         if prompt.startswith("/"):
             self.composer.clear()
+            if prompt.strip().lower() == "/clear":
+                self._save_chat_history()
             self._add_message("user", prompt)
             result = self._run_chat_command(prompt)
             self._add_message("assistant", result)
@@ -2526,6 +3155,9 @@ class QuasarDesktopApp(QMainWindow):
         self.orb.start_submission()
         self.composer.clear()
         self._add_message("user", prompt)
+        self._save_chat_history(
+            [*self.messages, {"role": "user", "content": prompt}]
+        )
         if office_monitor_error:
             self._add_message("assistant", office_monitor_error)
         self.last_activity_message = None
@@ -2591,7 +3223,11 @@ class QuasarDesktopApp(QMainWindow):
                     model,
                     messages,
                     prompt,
-                    live_analysis_server=None,
+                    live_analysis_server=getattr(
+                        self,
+                        "live_analysis_server",
+                        None,
+                    ),
                     mcp_manager=mcp_manager,
                     progress_callback=self.signals.request_progress.emit,
                     cancel_event=cancel_event,
@@ -2983,6 +3619,7 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self.messages[:] = request_messages
+        self._save_chat_history()
         self._clear_request_state()
         self._add_message("assistant", response)
         self._set_busy(False)
@@ -3023,6 +3660,8 @@ class QuasarDesktopApp(QMainWindow):
         self.provider_selector.setEnabled(not busy)
         self.model_selector.setEnabled(not busy)
         self.refresh_models_button.setEnabled(not busy)
+        if self.model_refresh_radial_button is not None:
+            self.model_refresh_radial_button.setEnabled(not busy)
         self.voice_button.setEnabled(not busy and not self.voice_processing)
         self.progress.setVisible(busy)
         self.orb.set_active(busy)
@@ -3219,6 +3858,16 @@ class QuasarDesktopApp(QMainWindow):
                 ).start()
             else:
                 self._close_mcp_manager(mcp_manager)
+        if self.live_analysis_server is not None:
+            try:
+                self.live_analysis_server.close()
+            except (OSError, RuntimeError) as error:
+                print(
+                    f"VS Code LSP 서버 종료 실패: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self.live_analysis_server = None
         agent.run_tool = self.original_run_tool
         agent.tool_approval_callback = self.original_tool_approval_callback
         agent.alarm_notification_callback = (

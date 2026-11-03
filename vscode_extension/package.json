@@ -1,7 +1,7 @@
 {
   "name": "quasar-live-analysis",
   "displayName": "Quasar Live Analysis",
-  "description": "Streams the active Python editor buffer to a local Quasar session for live syntax analysis.",
+  "description": "Connects VS Code language providers to Quasar for live editor updates, definitions, references, hover, and diagnostics.",
   "version": "0.1.0",
   "publisher": "quasar-local",
   "files": [

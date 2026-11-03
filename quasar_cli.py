@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import fnmatch
 import math
 import os
 import platform
@@ -106,8 +107,6 @@ DEBUG_INLINE_SECRET_PATTERN = re.compile(
     r"\s*(?:[:=]\s*|\s+)|\b[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)=|"
     r"--(?:password|token|secret|api[_-]?key)(?:=|\s+))([^\s,;]+)"
 )
-
-
 def print_markdown_response(answer: str) -> None:
     console.print("\n[bold cyan]Quasar:[/bold cyan]")
     console.print(Markdown(answer))
@@ -191,7 +190,10 @@ def get_max_tool_rounds(configured_value: int | None = None) -> int:
 
 def get_tool_calling_mode(configured_value: str | None = None) -> str:
     if configured_value is None:
-        configured_value = os.getenv("QUASAR_TOOL_CALLING_MODE", "legacy")
+        configured_value = os.getenv(
+            "QUASAR_TOOL_CALLING_MODE",
+            quasar_tool_calling.DYNAMIC_MODE,
+        )
     return quasar_tool_calling.resolve_tool_calling_mode(configured_value)
 
 
@@ -200,18 +202,43 @@ def _confirm_tool_action(name: str, arguments: dict[str, Any]) -> bool:
         command = arguments.get("command", "")
         if not isinstance(command, str) or not is_high_risk_command(command):
             return True
-    elif name not in {"todo_delete", "schedule_command", "gmail_send"}:
+    elif name not in {
+        "todo_delete",
+        "schedule_command",
+        "gmail_send",
+        "add_mcp_server",
+        "remove_mcp_server",
+    }:
         return True
+
+    approval_arguments = arguments
+    if name == "add_mcp_server":
+        server_config = arguments.get("server_config")
+        if isinstance(server_config, dict):
+            approval_arguments = {
+                **arguments,
+                "server_config": {
+                    **server_config,
+                    "env": {
+                        key: "[hidden]"
+                        for key in server_config.get("env", {})
+                    } if isinstance(server_config.get("env", {}), dict) else {},
+                },
+                "notice": (
+                    "환경 변수 값은 숨겨서 표시합니다. 승인하면 해당 값이 서버에 "
+                    "전달되고 MCP 설정 파일에 저장됩니다."
+                ),
+            }
 
     callback = tool_approval_callback
     if callback is not None:
-        return callback(name, arguments)
+        return callback(name, approval_arguments)
     if not sys.stdin.isatty():
         return False
     details = (
         str(arguments.get("command", ""))
         if name == "execute_cmd"
-        else json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        else json.dumps(approval_arguments, ensure_ascii=False, sort_keys=True)
     )
     try:
         approval = input(
@@ -353,23 +380,38 @@ def execute_cmd(command: str) -> str:
         return f"현재 디렉토리: {current_directory}"
 
     encoding = "cp949" if platform.system() == "Windows" else "utf-8"
+    log_path: Path | None = None
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=current_directory,
-            check=True,
-            capture_output=True,
-            text=True,
+        with tempfile.NamedTemporaryFile(
+            prefix="quasar-cmd-",
+            suffix=".log",
+            delete=False,
+        ) as log_file:
+            log_path = Path(log_file.name)
+
+        with log_path.open("w", encoding=encoding, errors="replace") as output:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=current_directory,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=platform.system() != "Windows",
+            )
+
+        output_text = log_path.read_text(
             encoding=encoding,
             errors="replace",
         )
-        output = result.stdout or result.stderr or "완료되었습니다."
-        return f"실행 성공:\n{output}"
-    except subprocess.CalledProcessError as error:
-        return f"실행 실패 (코드 {error.returncode}):\n{error.stderr or error.stdout}"
+        if result.returncode == 0:
+            return f"실행 성공:\n{output_text or '완료되었습니다.'}"
+        return f"실행 실패 (코드 {result.returncode}):\n{output_text}"
     except OSError as error:
         return f"시스템 오류:\n{error}"
+    finally:
+        if log_path is not None:
+            log_path.unlink(missing_ok=True)
 
 
 def resolve_workspace_path(path: str) -> Path:
@@ -536,6 +578,183 @@ def python_check_syntax(file_path: str) -> str:
         return f"Python 문법 오류: {file_path}:{error.lineno}:{error.offset} {error.msg}"
     except (OSError, UnicodeError, ValueError) as error:
         return f"Python 문법 검사 실패: {error}"
+
+
+def _iter_workspace_files(folder: Path, pattern: str):
+    excluded = {".git", ".venv", "venv", "__pycache__", "node_modules"}
+    root_pattern = pattern.removeprefix("**/")
+    for current, directories, filenames in os.walk(folder, followlinks=False):
+        directories[:] = sorted(
+            name for name in directories
+            if name not in excluded and not (Path(current) / name).is_symlink()
+        )
+        for filename in sorted(filenames):
+            path = Path(current) / filename
+            relative = path.relative_to(folder).as_posix()
+            if fnmatch.fnmatchcase(relative, pattern) or (
+                root_pattern != pattern
+                and fnmatch.fnmatchcase(relative, root_pattern)
+            ):
+                yield path
+
+
+def workspace_glob(pattern: str, directory: str = ".") -> str:
+    if not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+        return "Glob 검색 실패: 작업 폴더 안의 상대 패턴을 지정해 주세요."
+    try:
+        folder = resolve_workspace_path(directory)
+        if not folder.is_dir():
+            return f"Glob 검색 실패: 디렉터리가 아닙니다: {directory}"
+        matches: list[str] = []
+        for path in _iter_workspace_files(folder, pattern):
+            try:
+                resolved = resolve_workspace_path(str(path))
+            except (OSError, ValueError):
+                continue
+            if not resolved.is_file():
+                continue
+            matches.append(str(resolved.relative_to(current_directory)))
+            if len(matches) >= 500:
+                break
+        if not matches:
+            return f"Glob 검색 결과 없음: {pattern}"
+        suffix = "\n(최대 500개까지만 표시)" if len(matches) == 500 else ""
+        return f"Glob 검색 결과 ({len(matches)}개):\n" + "\n".join(sorted(matches)) + suffix
+    except (OSError, ValueError) as error:
+        return f"Glob 검색 실패: {error}"
+
+
+def grep_workspace(
+    pattern: str,
+    file_glob: str = "**/*",
+    directory: str = ".",
+    case_sensitive: bool = True,
+) -> str:
+    if not pattern:
+        return "Grep 실패: 검색 패턴을 입력해 주세요."
+    if Path(file_glob).is_absolute() or ".." in Path(file_glob).parts:
+        return "Grep 실패: 작업 폴더 안의 상대 파일 패턴을 지정해 주세요."
+    try:
+        expression = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+        folder = resolve_workspace_path(directory)
+        if not folder.is_dir():
+            return f"Grep 실패: 디렉터리가 아닙니다: {directory}"
+        matches: list[str] = []
+        scanned_files = 0
+        truncated = False
+        for path in _iter_workspace_files(folder, file_glob):
+            try:
+                resolved = resolve_workspace_path(str(path))
+            except (OSError, ValueError):
+                continue
+            if (
+                not resolved.is_file()
+                or resolved.stat().st_size > LIVE_ANALYSIS_MAX_BODY
+            ):
+                continue
+            scanned_files += 1
+            try:
+                contents, _ = read_workspace_text(resolved)
+            except (OSError, UnicodeError, ValueError):
+                continue
+            for line_number, line in enumerate(contents.splitlines(), start=1):
+                if expression.search(line):
+                    relative_path = resolved.relative_to(current_directory)
+                    matches.append(f"{relative_path}:{line_number}:{line.strip()}")
+                    if len(matches) >= 200:
+                        truncated = True
+                        break
+            if truncated or scanned_files >= 2000:
+                truncated = True
+                break
+        if not matches:
+            return f"Grep 검색 결과 없음 (파일 {scanned_files}개 검사)"
+        suffix = "\n(출력이 제한되었습니다. 검색 범위를 좁혀 주세요.)" if truncated else ""
+        return (
+            f"Grep 검색 결과 (파일 {scanned_files}개 검사, 일치 {len(matches)}개):\n"
+            + "\n".join(matches)
+            + suffix
+        )
+    except (OSError, re.error, ValueError) as error:
+        return f"Grep 실패: {error}"
+
+
+def python_ast_outline(file_path: str) -> str:
+    try:
+        source_path = resolve_workspace_path(file_path)
+        if not source_path.is_file() or source_path.suffix.lower() != ".py":
+            return "AST 분석 실패: 작업 폴더 안의 .py 파일을 지정해 주세요."
+        source, _ = read_workspace_text(source_path)
+        if len(source.encode("utf-8")) > LIVE_ANALYSIS_MAX_BODY:
+            return "AST 분석 실패: 파일이 1 MB 제한을 초과했습니다."
+        tree = ast.parse(source, filename=str(source_path))
+        outline: list[dict[str, Any]] = []
+
+        def visit(node: ast.AST, prefix: str = "") -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = f"{prefix}.{child.name}" if prefix else child.name
+                    entry: dict[str, Any] = {
+                        "kind": "class" if isinstance(child, ast.ClassDef) else "function",
+                        "name": name,
+                        "line": child.lineno,
+                        "end_line": child.end_lineno,
+                    }
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        entry["async"] = isinstance(child, ast.AsyncFunctionDef)
+                        entry["parameters"] = [
+                            argument.arg for argument in child.args.posonlyargs
+                            + child.args.args + child.args.kwonlyargs
+                        ]
+                        if child.args.vararg:
+                            entry["parameters"].append(f"*{child.args.vararg.arg}")
+                        if child.args.kwarg:
+                            entry["parameters"].append(f"**{child.args.kwarg.arg}")
+                    outline.append(entry)
+                    visit(child, name)
+                else:
+                    visit(child, prefix)
+
+        visit(tree)
+        return (
+            f"AST 구조: {source_path.relative_to(current_directory)}\n"
+            + json.dumps(outline, ensure_ascii=False, indent=2)
+        )
+    except SyntaxError as error:
+        return f"AST 분석 실패: {file_path}:{error.lineno}:{error.offset} {error.msg}"
+    except (OSError, UnicodeError, ValueError) as error:
+        return f"AST 분석 실패: {error}"
+
+
+def git_diff(file_path: str = "", staged: bool = False) -> str:
+    try:
+        command = ["git", "-C", str(current_directory), "diff", "--no-ext-diff", "--unified=3"]
+        command.append("--cached" if staged else "HEAD")
+        command.append("--")
+        if file_path:
+            target = resolve_workspace_path(file_path)
+            command.append(str(target.relative_to(current_directory)))
+        result = subprocess.run(
+            command,
+            cwd=current_directory,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if result.returncode:
+            return f"Git Diff 실패 (코드 {result.returncode}):\n{result.stderr.strip()}"
+        if not result.stdout:
+            return "Git diff 결과가 없습니다. 참고: 추적되지 않는 파일은 diff에 포함되지 않습니다."
+        if len(result.stdout) > 100_000:
+            return result.stdout[:100_000] + "\n... diff 출력이 100 KB에서 잘렸습니다."
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        return "Git Diff 실패: 10초 시간 제한을 초과했습니다."
+    except (OSError, ValueError) as error:
+        return f"Git Diff 실패: {error}"
 
 
 def python_run_file(file_path: str) -> str:
@@ -760,9 +979,12 @@ class CliLiveAnalysisServer:
         self.token = secrets.token_urlsafe(32)
         self._lock = threading.Lock()
         self._editor_update_condition = threading.Condition(self._lock)
+        self._lsp_condition = threading.Condition(self._lock)
         self._latest_document: dict[str, Any] | None = None
         self._last_diagnostics: dict[str, tuple[int | None, int | None, str] | None] = {}
         self._pending_editor_update: dict[str, Any] | None = None
+        self._pending_lsp_request: dict[str, Any] | None = None
+        self._lsp_response: dict[str, Any] | None = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._create_handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(
@@ -778,7 +1000,7 @@ class CliLiveAnalysisServer:
 
         class LiveAnalysisHandler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != "/editor-update":
+                if self.path not in {"/editor-update", "/lsp-request"}:
                     self.send_error(404)
                     return
                 if self.headers.get("Origin"):
@@ -789,12 +1011,16 @@ class CliLiveAnalysisServer:
                 if not hmac.compare_digest(supplied_token, analysis_server.token):
                     self.send_error(401)
                     return
-                update = analysis_server.pending_editor_update()
-                if not update:
+                payload = (
+                    analysis_server.pending_editor_update()
+                    if self.path == "/editor-update"
+                    else analysis_server.pending_lsp_request()
+                )
+                if not payload:
                     self.send_response(204)
                     self.end_headers()
                     return
-                body = json.dumps(update).encode("utf-8")
+                body = json.dumps(payload).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -802,7 +1028,11 @@ class CliLiveAnalysisServer:
                 self.wfile.write(body)
 
             def do_POST(self):
-                if self.path not in {"/live-analysis", "/editor-update/ack"}:
+                if self.path not in {
+                    "/live-analysis",
+                    "/editor-update/ack",
+                    "/lsp-response",
+                }:
                     self.send_error(404)
                     return
                 if self.headers.get("Origin"):
@@ -825,6 +1055,18 @@ class CliLiveAnalysisServer:
 
                 try:
                     payload = json.loads(self.rfile.read(int(content_length)))
+                    if self.path == "/lsp-response":
+                        request_id = payload["id"]
+                        if not isinstance(request_id, str):
+                            raise ValueError("invalid LSP request ID")
+                        analysis_server.respond_lsp_request(
+                            request_id,
+                            payload.get("result"),
+                            payload.get("error"),
+                        )
+                        self.send_response(204)
+                        self.end_headers()
+                        return
                     if self.path == "/editor-update/ack":
                         update_id = payload["id"]
                         status = payload["status"]
@@ -855,7 +1097,8 @@ class CliLiveAnalysisServer:
                 self.send_response(204)
                 self.end_headers()
 
-            def log_message(self, format, *args):
+            def log_message(self, _format, *_args):
+                del _format, _args
                 return
 
         return LiveAnalysisHandler
@@ -896,6 +1139,91 @@ class CliLiveAnalysisServer:
     def latest_document(self) -> dict[str, Any] | None:
         with self._lock:
             return self._latest_document.copy() if self._latest_document else None
+
+    def pending_lsp_request(self) -> dict[str, Any] | None:
+        with self._lsp_condition:
+            return (
+                self._pending_lsp_request.copy()
+                if self._pending_lsp_request is not None
+                else None
+            )
+
+    def respond_lsp_request(
+        self,
+        request_id: str,
+        result: Any,
+        error: Any,
+    ) -> None:
+        with self._lsp_condition:
+            request = self._pending_lsp_request
+            if request is None or request["id"] != request_id:
+                raise ValueError("unknown or expired LSP request")
+            self._lsp_response = {
+                "id": request_id,
+                "result": result,
+                "error": error,
+            }
+            self._lsp_condition.notify_all()
+
+    def query_lsp(
+        self,
+        file_path: str,
+        action: str,
+        line: int | None = None,
+        character: int | None = None,
+        include_declaration: bool = True,
+    ) -> str:
+        allowed_actions = {"definition", "references", "hover", "diagnostics"}
+        if action not in allowed_actions:
+            return f"LSP 조회 실패: 지원하지 않는 작업입니다: {action}"
+        try:
+            target_path = resolve_workspace_path(file_path)
+        except (OSError, ValueError) as error:
+            return f"LSP 조회 실패: {error}"
+        if not target_path.is_file():
+            return f"LSP 조회 실패: 파일을 찾을 수 없습니다: {file_path}"
+        if action != "diagnostics":
+            if (
+                not isinstance(line, int)
+                or isinstance(line, bool)
+                or line < 1
+                or not isinstance(character, int)
+                or isinstance(character, bool)
+                or character < 1
+            ):
+                return "LSP 조회 실패: line과 character는 1 이상의 정수여야 합니다."
+
+        with self._lsp_condition:
+            if self._pending_lsp_request is not None:
+                return "LSP 조회 실패: 다른 VS Code 분석 요청이 진행 중입니다."
+            request = {
+                "id": secrets.token_urlsafe(16),
+                "path": str(target_path),
+                "action": action,
+                "line": line,
+                "character": character,
+                "include_declaration": include_declaration,
+            }
+            self._pending_lsp_request = request
+            self._lsp_response = None
+            received = self._lsp_condition.wait_for(
+                lambda: (
+                    self._lsp_response is not None
+                    and self._lsp_response["id"] == request["id"]
+                ),
+                timeout=15,
+            )
+            response = self._lsp_response
+            if self._pending_lsp_request is request:
+                self._pending_lsp_request = None
+            if not received or response is None:
+                return (
+                    "LSP 조회 시간 초과: VS Code Quasar 확장이 연결되어 있는지 확인하세요. "
+                    "연결하려면 확장에서 'Quasar: Connect Live Analysis'를 실행하세요."
+                )
+            if response["error"]:
+                return f"LSP 조회 실패: {response['error']}"
+            return json.dumps(response["result"], ensure_ascii=False, indent=2)
 
     def queue_editor_update(self, source: str, save: bool = False) -> str:
         if len(source.encode("utf-8")) > LIVE_ANALYSIS_MAX_BODY:
@@ -2485,9 +2813,13 @@ class MCPStdioConnection:
 
 class MCPServerManager:
     def __init__(self, config_path: Path) -> None:
+        self.config_path = config_path
+        self._lock = threading.RLock()
         self.connections: dict[str, MCPStdioConnection] = {}
         self.tools: dict[str, tuple[MCPStdioConnection, str, dict[str, Any]]] = {}
         self.pending_servers: dict[str, dict[str, Any]] = {}
+        self.connection_errors: dict[str, str] = {}
+        self._config: dict[str, Any] = {"mcpServers": {}}
         if not config_path.exists():
             return
         try:
@@ -2497,6 +2829,7 @@ class MCPServerManager:
         servers = config.get("mcpServers") if isinstance(config, dict) else None
         if not isinstance(servers, dict):
             raise ValueError("MCP 설정 파일에는 mcpServers 객체가 필요합니다.")
+        self._config = config
 
         for server_name, server_config in servers.items():
             if not isinstance(server_name, str) or not server_name or not isinstance(server_config, dict):
@@ -2508,6 +2841,7 @@ class MCPServerManager:
                 else:
                     self._connect_server(server_name, server_config)
             except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+                self.connection_errors[server_name] = str(error)
                 print(f"[MCP 연결 실패] {server_name}: {error}", file=sys.stderr)
 
     @staticmethod
@@ -2520,30 +2854,171 @@ class MCPServerManager:
         )
 
     def _connect_server(self, server_name: str, server_config: dict[str, Any]) -> None:
-        if server_name in self.connections:
-            return
-        if self._is_chrome_devtools_server(server_config):
+        with self._lock:
+            if server_name in self.connections:
+                return
+            if self._is_chrome_devtools_server(server_config):
+                try:
+                    get_browser()
+                except (OSError, RuntimeError, TimeoutError, WebDriverException) as error:
+                    raise RuntimeError(f"Chrome을 시작할 수 없습니다: {error}") from error
+            connection = MCPStdioConnection(server_name, server_config)
             try:
-                get_browser()
-            except (OSError, RuntimeError, TimeoutError, WebDriverException) as error:
-                raise RuntimeError(f"Chrome을 시작할 수 없습니다: {error}") from error
-        connection = MCPStdioConnection(server_name, server_config)
+                server_tools = connection.list_tools()
+            except (OSError, RuntimeError, TimeoutError, ValueError):
+                connection.close()
+                raise
+
+            self.connections[server_name] = connection
+            self.connection_errors.pop(server_name, None)
+            used_names = {tool["function"]["name"] for tool in TOOLS}
+            used_names.update(self.tools)
+            for tool in server_tools:
+                tool_name = tool.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+                exposed_name = self._exposed_name(server_name, tool_name, used_names)
+                used_names.add(exposed_name)
+                self.tools[exposed_name] = (connection, tool_name, tool)
+
+    @staticmethod
+    def _validate_server_name(server_name: Any) -> str:
+        if (
+            not isinstance(server_name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", server_name)
+        ):
+            raise ValueError(
+                "MCP 서버 이름은 영문자/숫자로 시작하고, 영문자·숫자·._-만 "
+                "사용하는 1~64자여야 합니다."
+            )
+        return server_name
+
+    @staticmethod
+    def _validate_server_config(server_config: Any) -> dict[str, Any]:
+        if not isinstance(server_config, dict):
+            raise ValueError("server_config는 객체여야 합니다.")
+        command = server_config.get("command")
+        args = server_config.get("args", [])
+        environment = server_config.get("env", {})
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("server_config.command는 비어 있지 않은 문자열이어야 합니다.")
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError("server_config.args는 문자열 배열이어야 합니다.")
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            raise ValueError("server_config.env는 문자열 키와 값으로 구성된 객체여야 합니다.")
+        return {
+            "command": command,
+            "args": list(args),
+            "env": dict(environment),
+        }
+
+    def _persist_config(self, config: dict[str, Any]) -> None:
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
         try:
-            server_tools = connection.list_tools()
-        except (OSError, RuntimeError, TimeoutError, ValueError):
-            connection.close()
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.config_path.parent,
+                prefix=f".{self.config_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as config_file:
+                temporary_path = Path(config_file.name)
+                json.dump(config, config_file, ensure_ascii=False, indent=2)
+                config_file.write("\n")
+            os.replace(temporary_path, self.config_path)
+        except OSError:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
             raise
 
-        self.connections[server_name] = connection
-        used_names = {tool["function"]["name"] for tool in TOOLS}
-        used_names.update(self.tools)
-        for tool in server_tools:
-            tool_name = tool.get("name")
-            if not isinstance(tool_name, str) or not tool_name:
-                continue
-            exposed_name = self._exposed_name(server_name, tool_name, used_names)
-            used_names.add(exposed_name)
-            self.tools[exposed_name] = (connection, tool_name, tool)
+    def add_server(self, server_name: Any, server_config: Any) -> str:
+        server_name = self._validate_server_name(server_name)
+        normalized_config = self._validate_server_config(server_config)
+        with self._lock:
+            servers = self._config.setdefault("mcpServers", {})
+            if server_name in servers or server_name in self.pending_servers:
+                return f"MCP 서버 추가 실패: 이미 등록된 서버입니다: {server_name}"
+            self._connect_server(server_name, normalized_config)
+            updated_config = {
+                **self._config,
+                "mcpServers": {**servers, server_name: normalized_config},
+            }
+            try:
+                self._persist_config(updated_config)
+            except OSError as error:
+                self._disconnect_server(server_name)
+                return f"MCP 서버 설정 저장 실패: {error}"
+            self._config = updated_config
+            self.connection_errors.pop(server_name, None)
+            return (
+                f"MCP 서버를 추가하고 연결했습니다: {server_name} "
+                f"({len(self.connections)}개 서버 활성)"
+            )
+
+    def remove_server(self, server_name: Any) -> str:
+        server_name = self._validate_server_name(server_name)
+        with self._lock:
+            servers = self._config.setdefault("mcpServers", {})
+            if server_name not in servers and server_name not in self.pending_servers:
+                return f"MCP 서버 제거 실패: 등록된 서버가 없습니다: {server_name}"
+            updated_servers = dict(servers)
+            updated_servers.pop(server_name, None)
+            updated_config = {**self._config, "mcpServers": updated_servers}
+            try:
+                self._persist_config(updated_config)
+            except OSError as error:
+                return f"MCP 서버 설정 저장 실패: {error}"
+            self._config = updated_config
+            self.pending_servers.pop(server_name, None)
+            self.connection_errors.pop(server_name, None)
+            self._disconnect_server(server_name)
+            return f"MCP 서버를 제거하고 연결을 종료했습니다: {server_name}"
+
+    def list_servers(self) -> list[dict[str, Any]]:
+        with self._lock:
+            servers = self._config.get("mcpServers", {})
+            names = set(servers) if isinstance(servers, dict) else set()
+            names.update(self.pending_servers)
+            names.update(self.connections)
+            result = []
+            for server_name in sorted(names):
+                result.append({
+                    "name": server_name,
+                    "status": (
+                        "connected"
+                        if server_name in self.connections
+                        else "pending"
+                        if server_name in self.pending_servers
+                        else "configured_but_disconnected"
+                    ),
+                    **(
+                        {"error": self.connection_errors[server_name]}
+                        if server_name in self.connection_errors
+                        else {}
+                    ),
+                    "tools": sorted(
+                        exposed_name
+                        for exposed_name, (connection, _, _) in self.tools.items()
+                        if connection.name == server_name
+                    ),
+                })
+            return result
+
+    def _disconnect_server(self, server_name: str) -> None:
+        connection = self.connections.pop(server_name, None)
+        if connection is None:
+            return
+        self.tools = {
+            exposed_name: entry
+            for exposed_name, entry in self.tools.items()
+            if entry[0] is not connection
+        }
+        connection.close()
 
     @staticmethod
     def _exposed_name(server_name: str, tool_name: str, used_names: set[str]) -> str:
@@ -2560,74 +3035,79 @@ class MCPServerManager:
         return base
 
     def tool_schemas(self) -> list[dict[str, Any]]:
-        schemas = []
-        for exposed_name, (connection, tool_name, server_tool) in self.tools.items():
-            input_schema = server_tool.get("inputSchema")
-            description = server_tool.get("description")
-            if not isinstance(description, str) or not description.strip():
-                description = f"Call the '{tool_name}' tool provided by the '{connection.name}' MCP server."
-            schemas.append({
-                "type": "function",
-                "function": {
-                    "name": exposed_name,
-                    "description": description,
-                    "parameters": (
-                        input_schema
-                        if isinstance(input_schema, dict)
-                        else {"type": "object", "properties": {}}
-                    ),
-                },
-            })
-        return schemas
+        with self._lock:
+            schemas = []
+            for exposed_name, (connection, tool_name, server_tool) in self.tools.items():
+                input_schema = server_tool.get("inputSchema")
+                description = server_tool.get("description")
+                if not isinstance(description, str) or not description.strip():
+                    description = f"Call the '{tool_name}' tool provided by the '{connection.name}' MCP server."
+                schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": exposed_name,
+                        "description": description,
+                        "parameters": (
+                            input_schema
+                            if isinstance(input_schema, dict)
+                            else {"type": "object", "properties": {}}
+                        ),
+                    },
+                })
+            return schemas
 
     def find_tool_schemas(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        if self.pending_servers and re.search(
-            r"\b(chrome|browser|web|pages?|tabs?|navigate|navigation|websites?|url|click|screenshot|snapshot)\b",
-            query,
-            re.IGNORECASE,
-        ):
-            for server_name, server_config in list(self.pending_servers.items()):
-                try:
-                    self._connect_server(server_name, server_config)
-                except (OSError, RuntimeError, TimeoutError, ValueError) as error:
-                    print(f"[MCP 연결 실패] {server_name}: {error}", file=sys.stderr)
-                else:
-                    del self.pending_servers[server_name]
+        with self._lock:
+            if self.pending_servers and re.search(
+                r"\b(chrome|browser|web|pages?|tabs?|navigate|navigation|websites?|url|click|screenshot|snapshot)\b",
+                query,
+                re.IGNORECASE,
+            ):
+                for server_name, server_config in list(self.pending_servers.items()):
+                    try:
+                        self._connect_server(server_name, server_config)
+                    except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+                        self.connection_errors[server_name] = str(error)
+                        print(f"[MCP 연결 실패] {server_name}: {error}", file=sys.stderr)
+                    else:
+                        del self.pending_servers[server_name]
 
-        query_terms = {
-            term
-            for term in re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", query.lower())
-            if len(term) > 1
-        }
-        if not query_terms:
-            return []
+            query_terms = {
+                term
+                for term in re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", query.lower())
+                if len(term) > 1
+            }
+            if not query_terms:
+                return []
 
-        ranked_tools = []
-        for exposed_name, (_, tool_name, server_tool) in self.tools.items():
-            description = server_tool.get("description")
-            name_terms = set(re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", f"{exposed_name} {tool_name}".lower()))
-            description_terms = set(re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", (description or "").lower()))
-            score = sum(
-                (5 if term in name_terms else 0) + (1 if term in description_terms else 0)
-                for term in query_terms
-            )
-            if score:
-                ranked_tools.append((score, exposed_name))
-        ranked_tools.sort(key=lambda item: (-item[0], item[1]))
-        selected_names = {name for _, name in ranked_tools[:limit]}
-        return [
-            schema
-            for schema in self.tool_schemas()
-            if schema["function"]["name"] in selected_names
-        ]
+            ranked_tools = []
+            for exposed_name, (_, tool_name, server_tool) in self.tools.items():
+                description = server_tool.get("description")
+                name_terms = set(re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", f"{exposed_name} {tool_name}".lower()))
+                description_terms = set(re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", (description or "").lower()))
+                score = sum(
+                    (5 if term in name_terms else 0) + (1 if term in description_terms else 0)
+                    for term in query_terms
+                )
+                if score:
+                    ranked_tools.append((score, exposed_name))
+            ranked_tools.sort(key=lambda item: (-item[0], item[1]))
+            selected_names = {name for _, name in ranked_tools[:limit]}
+            return [
+                schema
+                for schema in self.tool_schemas()
+                if schema["function"]["name"] in selected_names
+            ]
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        connection, tool_name, _ = self.tools[name]
-        return connection.call_tool(tool_name, arguments)
+        with self._lock:
+            connection, tool_name, _ = self.tools[name]
+            return connection.call_tool(tool_name, arguments)
 
     def close(self) -> None:
-        for connection in self.connections.values():
-            connection.close()
+        with self._lock:
+            for server_name in list(self.connections):
+                self._disconnect_server(server_name)
 
 
 def tool_schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -2733,7 +3213,7 @@ TOOLS = [
     tool_schema("todo_add", "Add a task to the shared Todo app. The task appears in the web app immediately.", {"title": {"type": "string"}, "description": {"type": "string"}, "due_date": {"type": "string", "description": "Optional date in YYYY-MM-DD format."}, "priority": {"type": "string", "enum": ["low", "medium", "high"]}}, ["title"]),
     tool_schema("todo_update", "Update a task in the shared Todo app. Set only the fields that should change; completed is true or false.", {"task_id": {"type": "integer"}, "title": {"type": "string"}, "description": {"type": "string"}, "due_date": {"type": ["string", "null"], "description": "Date in YYYY-MM-DD format, or null to clear it."}, "priority": {"type": "string", "enum": ["low", "medium", "high"]}, "completed": {"type": "boolean"}}, ["task_id"]),
     tool_schema("todo_delete", "Permanently delete a task from the shared Todo app.", {"task_id": {"type": "integer"}}, ["task_id"]),
-    tool_schema("execute_cmd", "Run a system command in the current working directory. Use cd to change directories.", {"command": {"type": "string"}}, ["command"]),
+    tool_schema("execute_cmd", "Run a system command synchronously in the current working directory. Wait for it to exit and inspect its complete output and exit code before reporting results or starting a dependent command. Use cd to change directories.", {"command": {"type": "string"}}, ["command"]),
     tool_schema("rag_index_documents", "Index documents in a workspace directory for retrieval-augmented generation. Run before searching documents.", {"directory": {"type": "string"}}, []),
     tool_schema("rag_search", "Search indexed workspace documents for content relevant to a question. Use before answering questions based on workspace documents.", {"query": {"type": "string"}, "top_k": {"type": "integer"}}, ["query"]),
     tool_schema("web_search", "Search the public web independently of the controlled Chrome session and return up to five DuckDuckGo results.", {"query": {"type": "string"}}, ["query"]),
@@ -2759,11 +3239,19 @@ TOOLS = [
     tool_schema("vscode_open", "Open a file or directory inside the workspace in VS Code.", {"path": {"type": "string"}}, ["path"]),
     tool_schema("python_list_files", "List up to 100 Python files in a workspace directory.", {"directory": {"type": "string"}}, []),
     tool_schema("python_read_file", "Read a Python file inside the workspace.", {"file_path": {"type": "string"}}, ["file_path"]),
+    tool_schema("grep", "Search workspace source files with a regular expression. Returns matching file, line, and text; skips common generated/dependency directories.", {"pattern": {"type": "string"}, "file_glob": {"type": "string", "description": "Optional relative glob, such as **/*.py."}, "directory": {"type": "string"}, "case_sensitive": {"type": "boolean"}}, ["pattern"]),
+    tool_schema("glob", "Find workspace files matching a relative glob pattern, such as **/*.py or src/**/*.ts.", {"pattern": {"type": "string"}, "directory": {"type": "string"}}, ["pattern"]),
+    tool_schema("python_ast_outline", "Parse a Python file and return its class/function hierarchy, source line ranges, async status, and function parameters without executing it.", {"file_path": {"type": "string"}}, ["file_path"]),
+    tool_schema("git_diff", "Show Git changes relative to HEAD (or staged changes only). Optionally limit to a workspace file. Untracked files are not included.", {"file_path": {"type": "string"}, "staged": {"type": "boolean"}}, []),
+    tool_schema("lsp_query", "Query the connected VS Code language server for definition, references, hover/type information, or diagnostics. line and character are 1-based; diagnostics do not require a position. Requires the Quasar Live Analysis VS Code extension to be connected.", {"file_path": {"type": "string"}, "action": {"type": "string", "enum": ["definition", "references", "hover", "diagnostics"]}, "line": {"type": "integer"}, "character": {"type": "integer"}, "include_declaration": {"type": "boolean"}}, ["file_path", "action"]),
     tool_schema("read_workspace_file", "Read the full contents of a text file inside the workspace. Read existing files before modifying them in any language.", {"file_path": {"type": "string"}}, ["file_path"]),
     tool_schema("write_workspace_file", "Create or update a text file inside the workspace. Before updating, pass the exact contents read with read_workspace_file as expected_source to detect conflicts. Python files are syntax-checked before saving. Create a new file only when explicitly requested, with create=true and an empty expected_source.", {"file_path": {"type": "string"}, "source": {"type": "string"}, "expected_source": {"type": "string"}, "create": {"type": "boolean"}}, ["file_path", "source", "expected_source"]),
     tool_schema("python_check_syntax", "Check the syntax of a Python file in the workspace without running it.", {"file_path": {"type": "string"}}, ["file_path"]),
     tool_schema("python_run_file", "Run a Python file in the workspace when execution is enabled, with a 30-second timeout.", {"file_path": {"type": "string"}}, ["file_path"]),
     tool_schema("discover_mcp_tools", "Search connected MCP tools when a request needs an integration not covered by the available tools. Provide an English query describing the required capability. Matching tool schemas will be available in the next step.", {"query": {"type": "string", "description": "English keywords for the needed tool or capability."}}, ["query"]),
+    tool_schema("list_mcp_servers", "List configured MCP servers and their connection status without exposing environment variable values.", {}, []),
+    tool_schema("add_mcp_server", "Add and immediately connect an MCP stdio server. Requires explicit user approval; command, args, and env values are persisted to the MCP config file. Use only a server the user requested.", {"server_name": {"type": "string"}, "server_config": {"type": "object", "properties": {"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}, "env": {"type": "object", "additionalProperties": {"type": "string"}}}, "required": ["command"]}}, ["server_name", "server_config"]),
+    tool_schema("remove_mcp_server", "Remove a configured MCP server and immediately close its connection. Requires explicit user approval.", {"server_name": {"type": "string"}}, ["server_name"]),
     tool_schema(
         "message_to_user",
         "Show a brief live update in the user's chat while a multi-step task is running. Send progress before the first lengthy operation, after each meaningful phase, and before another lengthy wait; do not wait until the final answer. Use error immediately for a blocker and state the recovery you are attempting. Combine quick related actions instead of narrating every tool call. Avoid duplicate updates and quick single-step narration. Keep each message actionable and under 1200 characters.",
@@ -2791,8 +3279,6 @@ def _available_tool_schemas(
         ]
     else:
         dynamic_entry_names = {"end", "message_to_user"}
-        if mcp_manager is not None and mcp_manager.tools:
-            dynamic_entry_names.add("discover_mcp_tools")
         if any(
             tool["function"]["name"] == "set_tts_enabled"
             for tool in TOOLS
@@ -2839,6 +3325,44 @@ def run_tool(
     live_analysis_server: CliLiveAnalysisServer | None = None,
     mcp_manager: MCPServerManager | None = None,
 ) -> str | tuple[str, int, int]:
+    if name == "list_mcp_servers":
+        if mcp_manager is None:
+            return "MCP 서버 관리자를 사용할 수 없습니다."
+        return json.dumps(mcp_manager.list_servers(), ensure_ascii=False, indent=2)
+    if name == "add_mcp_server":
+        if mcp_manager is None:
+            return "MCP 서버 관리자를 사용할 수 없습니다."
+        try:
+            server_name = MCPServerManager._validate_server_name(
+                arguments.get("server_name")
+            )
+            server_config = MCPServerManager._validate_server_config(
+                arguments.get("server_config")
+            )
+        except ValueError as error:
+            return f"MCP 서버 추가 실패: {error}"
+        if not _confirm_tool_action(name, arguments):
+            return f"MCP 서버 추가가 사용자에 의해 승인되지 않았습니다: {server_name}"
+        try:
+            return mcp_manager.add_server(server_name, server_config)
+        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+            return f"MCP 서버 추가 실패 ({server_name}): {error}"
+    if name == "remove_mcp_server":
+        if mcp_manager is None:
+            return "MCP 서버 관리자를 사용할 수 없습니다."
+        try:
+            server_name = MCPServerManager._validate_server_name(
+                arguments.get("server_name")
+            )
+        except ValueError as error:
+            return f"MCP 서버 제거 실패: {error}"
+        if not _confirm_tool_action(name, arguments):
+            return f"MCP 서버 제거가 사용자에 의해 승인되지 않았습니다: {server_name}"
+        try:
+            return mcp_manager.remove_server(server_name)
+        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+            return f"MCP 서버 제거 실패 ({server_name}): {error}"
+
     is_high_risk_action = name in {"todo_delete", "schedule_command", "gmail_send"}
     if name == "execute_cmd":
         command = arguments.get("command", "")
@@ -2945,6 +3469,38 @@ def run_tool(
         return python_list_files(arguments.get("directory", "."))
     if name == "python_read_file":
         return python_read_file(arguments["file_path"])
+    if name == "grep":
+        return grep_workspace(
+            arguments["pattern"],
+            arguments.get("file_glob", "**/*"),
+            arguments.get("directory", "."),
+            arguments.get("case_sensitive", True),
+        )
+    if name == "glob":
+        return workspace_glob(
+            arguments["pattern"],
+            arguments.get("directory", "."),
+        )
+    if name == "python_ast_outline":
+        return python_ast_outline(arguments["file_path"])
+    if name == "git_diff":
+        return git_diff(
+            arguments.get("file_path", ""),
+            arguments.get("staged", False),
+        )
+    if name == "lsp_query":
+        if live_analysis_server is None:
+            return (
+                "LSP 조회 실패: 현재 VS Code LSP 연결이 없습니다. "
+                "Quasar CLI의 Endpoint/Token으로 'Quasar: Connect Live Analysis'를 연결하세요."
+            )
+        return live_analysis_server.query_lsp(
+            arguments["file_path"],
+            arguments["action"],
+            arguments.get("line"),
+            arguments.get("character"),
+            arguments.get("include_declaration", True),
+        )
     if name == "read_workspace_file":
         return read_workspace_file(arguments["file_path"])
     if name == "write_workspace_file":
@@ -3005,6 +3561,19 @@ def print_debug_event(title: str, details: Any) -> None:
 
 
 def _debug_tool_call(name: str, arguments: dict[str, Any]) -> None:
+    if name == "add_mcp_server":
+        server_config = arguments.get("server_config")
+        if isinstance(server_config, dict):
+            arguments = {
+                **arguments,
+                "server_config": {
+                    **server_config,
+                    "env": {
+                        key: "[REDACTED]"
+                        for key in server_config.get("env", {})
+                    } if isinstance(server_config.get("env", {}), dict) else {},
+                },
+            }
     print_debug_event("모델 도구 호출", {"tool": name, "arguments": arguments})
 
 
@@ -3268,11 +3837,11 @@ def request_agent(
             {
                 "role": "system",
                 "content": (
-                    "도구는 카테고리별로 동적으로 제공됩니다. 먼저 list_tool_categories로 "
-                    "기능을 확인한 뒤 작업에 필요한 카테고리를 load_tool_categories 한 번에 "
-                    "여러 개 로드하세요. 작업 도중 필요한 카테고리를 추가로 로드할 수 있으며, "
-                    "이미 로드한 도구는 요청이 끝날 때까지 유지됩니다. 연결된 MCP 기능이 "
-                    "필요하면 discover_mcp_tools를 사용하세요."
+                    "먼저 요청의 최종 목표와 수행 단계를 생각한 뒤, 초기 도구 목록의 "
+                    "select_tool_categories에서 필요한 카테고리를 모두 선택하세요. "
+                    "처음에는 카테고리 선택 도구와 제어 도구만 제공됩니다. 선택한 카테고리의 "
+                    "도구만 사용할 수 있으며, 작업 중 다른 카테고리가 필요하면 해당 카테고리를 "
+                    "추가 선택하세요. 선택하지 않은 카테고리의 도구를 사용할 수 있다고 가정하지 마세요."
                 ),
             },
         )
@@ -3351,15 +3920,13 @@ def request_agent(
                     if progress_callback is not None:
                         progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
-                if tool_call.function.name == "list_tool_categories":
-                    result = quasar_tool_calling.get_category_names()
-                elif tool_call.function.name == "load_tool_categories":
+                if tool_call.function.name == "select_tool_categories":
                     result = quasar_tool_calling.load_categories(
                         arguments.get("categories"),
                         loaded_categories,
                         TOOLS,
                     )
-                if tool_call.function.name == "discover_mcp_tools":
+                elif tool_call.function.name == "discover_mcp_tools":
                     if mcp_manager is None:
                         result = "No MCP server is configured."
                     else:
@@ -3376,10 +3943,16 @@ def request_agent(
                             if discovered
                             else "No matching MCP tools found. Try a different English query."
                         )
-                elif tool_call.function.name not in {
-                    "list_tool_categories",
-                    "load_tool_categories",
-                }:
+                        if not discovered and mcp_manager.connection_errors:
+                            result += (
+                                "\nMCP connection failures (exact reported errors; "
+                                "do not infer their cause): "
+                                + json.dumps(
+                                    mcp_manager.connection_errors,
+                                    ensure_ascii=False,
+                                )
+                            )
+                else:
                     result = run_tool(
                         tool_call.function.name,
                         arguments,
@@ -3507,15 +4080,13 @@ def request_agent_with_responses(
                     if progress_callback is not None:
                         progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
-                if tool_call.name == "list_tool_categories":
-                    result = quasar_tool_calling.get_category_names()
-                elif tool_call.name == "load_tool_categories":
+                if tool_call.name == "select_tool_categories":
                     result = quasar_tool_calling.load_categories(
                         arguments.get("categories"),
                         loaded_categories,
                         TOOLS,
                     )
-                if tool_call.name == "discover_mcp_tools":
+                elif tool_call.name == "discover_mcp_tools":
                     if mcp_manager is None:
                         result = "No MCP server is configured."
                     else:
@@ -3532,10 +4103,16 @@ def request_agent_with_responses(
                             if discovered
                             else "No matching MCP tools found. Try a different English query."
                         )
-                elif tool_call.name not in {
-                    "list_tool_categories",
-                    "load_tool_categories",
-                }:
+                        if not discovered and mcp_manager.connection_errors:
+                            result += (
+                                "\nMCP connection failures (exact reported errors; "
+                                "do not infer their cause): "
+                                + json.dumps(
+                                    mcp_manager.connection_errors,
+                                    ensure_ascii=False,
+                                )
+                            )
+                else:
                     result = run_tool(
                         tool_call.name,
                         arguments,
@@ -3607,13 +4184,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--tool-calling-mode",
         choices=quasar_tool_calling.TOOL_CALLING_MODES,
-        help="도구 호출 방식 (기본값: QUASAR_TOOL_CALLING_MODE 또는 legacy)",
+        help="도구 호출 방식 (기본값: QUASAR_TOOL_CALLING_MODE 또는 dynamic)",
     )
     parser.add_argument(
         "--mcp-config",
         help="MCP 서버 설정 JSON 파일 (기본값: 작업 폴더의 .mcp.json, 없으면 CLI 폴더의 .mcp.json)",
     )
     args = parser.parse_args(argv)
+    try:
+        tool_calling_mode = get_tool_calling_mode(args.tool_calling_mode)
+    except ValueError as error:
+        parser.error(str(error))
 
     global current_directory, auto_approve_commands
     if args.cwd:
@@ -3682,7 +4263,7 @@ def main(argv: list[str] | None = None) -> None:
     #     "todo_update, and todo_delete; the web app and Quasar use the same local SQLite database. Use these tools "
     #     "for todo requests and confirm their result before reporting a change."
     # )
-    tool_descriptions = (
+    legacy_tool_descriptions = (
         "- todo_list: list to-do items\n"
         "- todo_add: add a to-do item\n"
         "- todo_update: edit a to-do item or change its completion status\n"
@@ -3710,6 +4291,11 @@ def main(argv: list[str] | None = None) -> None:
         "- vscode_open: open a file or folder in VS Code\n"
         "- python_list_files: list Python files in the working directory\n"
         "- python_read_file: read a Python file\n"
+        "- grep: search workspace source with a regular expression\n"
+        "- glob: find workspace files by a glob pattern\n"
+        "- python_ast_outline: inspect Python class/function structure\n"
+        "- git_diff: show tracked changes relative to HEAD\n"
+        "- lsp_query: query VS Code definitions, references, hover, or diagnostics\n"
         "- read_workspace_file: read a text file in the working directory\n"
         "- write_workspace_file: create or edit a text file in the working directory\n"
         "- python_check_syntax: check the syntax of a Python file\n"
@@ -3719,6 +4305,53 @@ def main(argv: list[str] | None = None) -> None:
         "- end: finish the current request and return the final response\n"
         "- MCP tools: run external integrations discovered through search"
     )
+    if tool_calling_mode == quasar_tool_calling.DYNAMIC_MODE:
+        tool_descriptions = (
+            "처음에는 select_tool_categories와 제어 도구만 제공됩니다. "
+            "실제 작업 도구는 사용자가 요청한 작업에 필요한 카테고리를 선택한 뒤 제공됩니다."
+        )
+        domain_instructions = (
+            "For workspace documents, select the files category before using document tools; search indexed documents, "
+            "cite source paths, and do not invent facts. Prefer the active VS Code file and do not summarize unrelated content. "
+            "For coding, pair program and ask only if ambiguity changes the implementation. Select the code or files category "
+            "before using its tools. Read files before editing, use the exact expected source when saving, and create files "
+            "only on explicit request. Do not edit through VS Code editor controls, run unrelated commands, or claim unverified results. "
+            "For focused source searches, file selection, Python structure, Git changes, or definitions/references/types/diagnostics, "
+            "select the code_analysis category. VS Code LSP queries require the Quasar Live Analysis extension to be connected. "
+            "For public-web searches or browser actions, select the web category. Keep public-web research separate from the "
+            "controlled browser session. Use the current tab unless the user requests a new tab or specifies another tab. "
+            "Inspect the page DOM before interacting; if it is insufficient, inspect a screenshot. Reinspect after navigation "
+            "or a meaningful page-state change. Do not repeat navigation to the same URL or a successful action without reason. "
+            "Verify browser results before reporting them. Send email only when explicitly requested and approved; otherwise draft. "
+            "Select the integrations category to discover connected MCP tools, using an English capability query."
+        )
+    else:
+        tool_descriptions = legacy_tool_descriptions
+        domain_instructions = (
+            "For workspace documents, search with rag_search (index first with rag_index_documents if needed), cite source paths, "
+            "and do not invent facts. Prefer the active VS Code file; do not summarize unrelated workspace content. "
+            "For coding, pair program and ask only if ambiguity changes the implementation. Read files with read_workspace_file "
+            "before editing; save with write_workspace_file and the exact expected_source. Create files only on explicit request. "
+            "Do not use VS Code editor tools for edits, run unrelated commands, or claim unverified results; report conflicts/failures. "
+            "Use web_search for independent public-web searches; it must not open or change the controlled Chrome session. "
+            "When asked to open a URL in a new tab, use web_open_new_tab and report its actual result. "
+            "For other requests to open or go to a URL, use web_navigate directly and report its actual result; do not substitute a search result link "
+            "or claim a browser-control limitation without trying the tool. The controlled Chrome starts with one tab; "
+            "create another tab only when the user requests one. Use web_list_tabs to inspect tab order, stable IDs, titles, URLs, and ownership. "
+            "When the user specifies a tab by number, ID, or title, identify it with web_list_tabs if needed and use "
+            "web_switch_tab before any browser action; keep using that selected tab until the user specifies another. "
+            "If no tab is specified, use the currently selected tab. Browser actions operate in the selected tab. "
+            "Before interacting with a web page, inspect its DOM with the browser snapshot or page-evaluation tools. "
+            "If the DOM does not provide enough information to understand the page or choose a target, take and inspect a screenshot "
+            "before acting. Reinspect the DOM after navigation or a meaningful page-state change before continuing. "
+            "When needed, discover browser tools with an English query mentioning DOM snapshot, page evaluation, and screenshot. "
+            "When a requested URL is already open in the selected tab, do not call web_navigate again; continue with "
+            "web_click, web_input, web_scroll, or another relevant action on that page. Do not repeat a successful "
+            "browser action unless the user asks for it or new information requires it. "
+            "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
+            "Never promise a retry before making it or claim success without a confirming tool result. For web_input, inspect the returned "
+            "result and do not claim text was entered or sent unless verified."
+        )
     system_prompt = (
         "You are Quasar, a business-automation CLI agent. Understand requests and answer clearly in Korean. Use tools when "
         "useful; answer greetings directly. Never expose tool JSON, schemas, or internal routing. Run Python only when enabled.\n\n"
@@ -3729,37 +4362,22 @@ def main(argv: list[str] | None = None) -> None:
         "then report each meaningful phase completion and the next step before another lengthy wait; do not wait until the final answer. "
         "For several quick related actions, combine them into one update rather than narrating every tool call. "
         "When a tool fails or blocks progress, immediately use kind='error' to state the observed cause and your concrete recovery attempt; "
+        "never infer that Node.js or npx is missing from an MCP failure alone. Before recommending installation or a restart, "
+        "verify node --version and npx --version in the same environment and report their actual results; otherwise state the exact MCP error "
+        "and distinguish confirmed facts from possible causes. A WinError 2 only establishes that the configured executable could not be resolved "
+        "for that process launch; it does not by itself prove Node.js is absent or that PATH is stale. Never recommend rebooting or restarting the IDE/app "
+        "as a generic fix. Inspect list_mcp_servers and the exact command/configuration, then test node --version and npx --version using execute_cmd "
+        "in this process environment before proposing a cause or remedy. "
         "after recovery, report the outcome and continue verifying. Do not send duplicate updates or routine narration for simple questions and quick actions. "
         "Keep messages short, factual, and actionable; never claim completion until verified. "
         "If a tool result indicates failure, do not give up immediately: use available diagnostic tools to identify the cause, apply a safe fix, and verify the result. "
         "Do not repeat the same tool call with the same arguments and approach without a reason; adapt based on new information. "
+        "execute_cmd waits for each command to exit and returns its captured output and exit code. Inspect that result before reporting completion or starting a dependent command. "
         "After using a tool, forget its usage instructions. Before making another tool call, re-check the current request and the available tool definitions. "
         "This does not mean forgetting or ignoring system safety rules or user-approval requirements. "
         "Before retrying a consequential or difficult-to-reverse action, such as deleting data or sending something externally, obtain any necessary user confirmation. "
         "Attempt recovery within the tool-call limit. If no further safe or useful action is possible, clearly report the failure cause and what remains incomplete.\n\n"
-        "For workspace documents, search with rag_search (index first with rag_index_documents if needed), cite source paths, "
-        "and do not invent facts. Prefer the active VS Code file; do not summarize unrelated workspace content. "
-        "For coding, pair program and ask only if ambiguity changes the implementation. Read files with read_workspace_file "
-        "before editing; save with write_workspace_file and the exact expected_source. Create files only on explicit request. "
-        "Do not use VS Code editor tools for edits, run unrelated commands, or claim unverified results; report conflicts/failures. "
-        "Use web_search for independent public-web searches; it must not open or change the controlled Chrome session. "
-        "When asked to open a URL in a new tab, use web_open_new_tab and report its actual result. "
-        "For other requests to open or go to a URL, use web_navigate directly and report its actual result; do not substitute a search result link "
-        "or claim a browser-control limitation without trying the tool. The controlled Chrome starts with one tab; "
-        "create another tab only when the user requests one. Use web_list_tabs to inspect tab order, stable IDs, titles, URLs, and ownership. "
-        "When the user specifies a tab by number, ID, or title, identify it with web_list_tabs if needed and use "
-        "web_switch_tab before any browser action; keep using that selected tab until the user specifies another. "
-        "If no tab is specified, use the currently selected tab. Browser actions operate in the selected tab. "
-        "Before interacting with a web page, inspect its DOM with the browser snapshot or page-evaluation tools. "
-        "If the DOM does not provide enough information to understand the page or choose a target, take and inspect a screenshot "
-        "before acting. Reinspect the DOM after navigation or a meaningful page-state change before continuing. "
-        "When needed, discover browser tools with an English query mentioning DOM snapshot, page evaluation, and screenshot. "
-        "When a requested URL is already open in the selected tab, do not call web_navigate again; continue with "
-        "web_click, web_input, web_scroll, or another relevant action on that page. Do not repeat a successful "
-        "browser action unless the user asks for it or new information requires it. "
-        "For a requested browser action, call the appropriate browser tool in the same turn before describing it. "
-        "Never promise a retry before making it or claim success without a confirming tool result. For web_input, inspect the returned "
-        "result and do not claim text was entered or sent unless verified. "
+        f"{domain_instructions}\n"
         "Available tools:\n"
         f"{tool_descriptions}\n\n"
         "For every agent task, once the requested work is complete, stop all further work and immediately call end with the final result. "
@@ -3823,7 +4441,7 @@ def main(argv: list[str] | None = None) -> None:
                     user_input,
                     live_analysis_server,
                     mcp_manager,
-                    tool_calling_mode=args.tool_calling_mode,
+                    tool_calling_mode=tool_calling_mode,
                 )
                 print_markdown_response(answer)
             except Exception as error:

@@ -740,7 +740,8 @@ class VoiceWorkerTests(unittest.TestCase):
         original_run_tool = Mock(return_value="delegated")
         app = types.SimpleNamespace(
             signals=types.SimpleNamespace(
-                tts_enabled_requested=types.SimpleNamespace(emit=emitted.append)
+                tts_enabled_requested=types.SimpleNamespace(emit=emitted.append),
+                agent_message=types.SimpleNamespace(emit=Mock()),
             ),
             original_run_tool=original_run_tool,
         )
@@ -763,6 +764,19 @@ class VoiceWorkerTests(unittest.TestCase):
         original_run_tool.assert_called_once_with(
             "get_current_time",
             {},
+            None,
+            None,
+        )
+        original_run_tool.reset_mock()
+        result = Quasar.QuasarDesktopApp._run_tool(
+            app,
+            "execute_cmd",
+            {"command": "python -m http.server"},
+        )
+        self.assertEqual(result, "delegated")
+        original_run_tool.assert_called_once_with(
+            "execute_cmd",
+            {"command": "python -m http.server"},
             None,
             None,
         )
