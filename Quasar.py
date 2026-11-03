@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import csv
 import json
 import math
@@ -24,7 +25,7 @@ from urllib.request import Request, urlopen
 
 import quasar_cli as agent
 from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal
-from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QIcon, QKeyEvent, QKeySequence, QShortcut
 from quasar_galaxy import (
     CANVAS_BACKGROUND_STOPS,
     BlackHoleOverlay,
@@ -61,6 +62,7 @@ BACKGROUND = "#070a16"
 TEXT = "#e7eaff"
 MUTED = "#929bb8"
 ACCENT = "#9b91ff"
+WINDOWS_APP_USER_MODEL_ID = "readonlymemory1.Quasar"
 
 SYSTEM_PROMPT = (
     "You are Quasar. Respond concisely and accurately in the language the user uses, "
@@ -73,7 +75,8 @@ SYSTEM_PROMPT = (
     "for simple questions or quick actions. Do not claim completion until verified. "
     "When the user asks to turn spoken responses on or off, use the set_tts_enabled tool. "
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
-    "Run requested commands without showing confirmation dialogs. "
+    "Run requested low-risk commands without a confirmation dialog. Always obtain explicit user approval "
+    "before destructive commands such as deleting files or changing system settings. "
     "Send email only when explicitly requested, and clarify ambiguous requests first. "
     "For browser tasks, navigate to the requested page once, then continue interacting with the current page. "
     "Do not navigate to or reload the same URL again unless the user explicitly asks to refresh or revisit it. "
@@ -119,6 +122,7 @@ class AppSignals(QObject):
     speech_finished = Signal(object)
     speech_failed = Signal(object, str)
     tts_enabled_requested = Signal(bool)
+    tool_approval_requested = Signal(str, str, object)
     audio_test_ready = Signal(object)
     audio_test_failed = Signal(str)
     audio_test_playback_finished = Signal()
@@ -165,6 +169,7 @@ class MicrophoneSettingsDialog(QDialog):
         self,
         selected_device_index: int | None,
         max_tool_rounds: int,
+        tool_calling_mode: str,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -186,6 +191,15 @@ class MicrophoneSettingsDialog(QDialog):
             "요청에서 도구를 호출하고 결과를 반영하는 최대 반복 횟수"
         )
         form.addRow("도구 반복 한도", self.tool_rounds_selector)
+        self.tool_calling_mode_selector = QComboBox()
+        self.tool_calling_mode_selector.addItem("기존 방식 (모든 도구 제공)", "legacy")
+        self.tool_calling_mode_selector.addItem("동적 방식 (카테고리별 로드)", "dynamic")
+        mode_index = self.tool_calling_mode_selector.findData(tool_calling_mode)
+        self.tool_calling_mode_selector.setCurrentIndex(max(0, mode_index))
+        self.tool_calling_mode_selector.setToolTip(
+            "동적 방식은 먼저 도구 카테고리를 선택하고 필요한 도구만 요청별로 제공합니다."
+        )
+        form.addRow("도구 호출 방식", self.tool_calling_mode_selector)
         layout.addLayout(form)
 
         self.microphone_status = QLabel()
@@ -261,6 +275,10 @@ class MicrophoneSettingsDialog(QDialog):
     @property
     def max_tool_rounds(self) -> int:
         return self.tool_rounds_selector.value()
+
+    @property
+    def tool_calling_mode(self) -> str:
+        return str(self.tool_calling_mode_selector.currentData())
 
     def _toggle_audio_test_recording(self) -> None:
         if self.audio_test_worker is not None and self.audio_test_worker.is_alive():
@@ -1290,6 +1308,7 @@ class QuasarDesktopApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Quasar")
+        self.setWindowIcon(QIcon(str(Path(__file__).with_name("quasar_icon.png"))))
         self.resize(1080, 720)
         self.setMinimumSize(760, 560)
         self.setStyleSheet(
@@ -1415,6 +1434,14 @@ class QuasarDesktopApp(QMainWindow):
         except ValueError as error:
             self.max_tool_rounds = agent.DEFAULT_MAX_TOOL_ROUNDS
             self.tool_rounds_error = str(error)
+        self.tool_calling_mode_error: str | None = None
+        try:
+            self.tool_calling_mode = agent.get_tool_calling_mode(
+                self.settings.value("agent/tool_calling_mode", None, type=str)
+            )
+        except ValueError as error:
+            self.tool_calling_mode = agent.quasar_tool_calling.LEGACY_MODE
+            self.tool_calling_mode_error = str(error)
         self.office_monitor: agent.CliCollaborationMonitor | None = None
         self.office_monitor_client: Any = None
         self.office_monitor_source: _OfficeDocumentSource | None = None
@@ -1466,6 +1493,7 @@ class QuasarDesktopApp(QMainWindow):
         self.signals.speech_finished.connect(self._finish_speech)
         self.signals.speech_failed.connect(self._finish_speech_error)
         self.signals.tts_enabled_requested.connect(self._set_tts_enabled)
+        self.signals.tool_approval_requested.connect(self._show_tool_approval)
 
         self.provider = os.getenv("AI_PROVIDER", "ollama").lower()
         self.client: Any = None
@@ -1474,6 +1502,7 @@ class QuasarDesktopApp(QMainWindow):
         self.original_alarm_notification_callback = (
             agent.alarm_notification_callback
         )
+        self.original_tool_approval_callback = agent.tool_approval_callback
         self.alarm_notifications: list[QMessageBox] = []
         self._create_client(self.provider)
         self.original_run_tool = agent.run_tool
@@ -1871,6 +1900,7 @@ class QuasarDesktopApp(QMainWindow):
         dialog = MicrophoneSettingsDialog(
             self.microphone_device_index,
             self.max_tool_rounds,
+            self.tool_calling_mode,
             self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1923,6 +1953,10 @@ class QuasarDesktopApp(QMainWindow):
             "agent/max_tool_rounds",
             dialog.max_tool_rounds,
         )
+        self.settings.setValue(
+            "agent/tool_calling_mode",
+            dialog.tool_calling_mode,
+        )
         if selected_device is None:
             self.settings.remove("audio/input_device_name")
             self.settings.remove("audio/input_device_host_api")
@@ -1945,12 +1979,14 @@ class QuasarDesktopApp(QMainWindow):
             QMessageBox.warning(
                 self,
                 "설정 저장 실패",
-                "마이크 선택을 저장하지 못했습니다. 다시 시도해 주세요.",
+                "설정을 저장하지 못했습니다. 다시 시도해 주세요.",
             )
             return
         self.microphone_device_index = selected_device_index
         self.max_tool_rounds = dialog.max_tool_rounds
+        self.tool_calling_mode = dialog.tool_calling_mode
         self.tool_rounds_error = None
+        self.tool_calling_mode_error = None
         self.microphone_notice = None
         self.status_label.setText(
             f"입력 마이크: {dialog.selected_device_name}"
@@ -2017,6 +2053,8 @@ class QuasarDesktopApp(QMainWindow):
                 f"{status} · 도구 반복 한도 설정 오류: {self.tool_rounds_error} "
                 f"(기본값 {self.max_tool_rounds} 사용)"
             )
+        if self.tool_calling_mode_error:
+            status = f"{status} · 도구 호출 방식 설정 오류: {self.tool_calling_mode_error}"
         self.status_label.setText(status)
 
     def _ensure_office_monitor(self) -> agent.CliCollaborationMonitor:
@@ -2350,6 +2388,7 @@ class QuasarDesktopApp(QMainWindow):
         agent.current_directory = Path(__file__).resolve().parent
         agent.auto_approve_commands = True
         agent.run_tool = self._run_tool
+        agent.tool_approval_callback = self._request_tool_approval
         if hasattr(self, "signals"):
             agent.alarm_notification_callback = self.signals.alarm_triggered.emit
         mcp_config_path = agent.resolve_mcp_config_path(
@@ -2363,6 +2402,43 @@ class QuasarDesktopApp(QMainWindow):
             self.mcp_startup_error = (
                 f"MCP 설정을 읽지 못했습니다 ({mcp_config_path}): {error}"
             )
+
+    def _request_tool_approval(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> bool:
+        event = threading.Event()
+        request = {"event": event, "approved": False}
+        details = json.dumps(arguments, ensure_ascii=False, indent=2, default=str)
+        if len(details) > 4000:
+            details = details[:4000] + "\n... (나머지 생략)"
+        self.signals.tool_approval_requested.emit(name, details, request)
+        if not event.wait(timeout=120):
+            return False
+        return bool(request["approved"])
+
+    def _show_tool_approval(
+        self,
+        name: str,
+        details: str,
+        request: dict[str, Any],
+    ) -> None:
+        event = request.get("event")
+        if not isinstance(event, threading.Event):
+            return
+        if self.closing:
+            event.set()
+            return
+        answer = QMessageBox.warning(
+            self,
+            "위험 작업 승인",
+            f"도구 '{name}'이(가) 다음 작업을 요청했습니다.\n\n{details}\n\n실행할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        request["approved"] = answer == QMessageBox.StandardButton.Yes
+        event.set()
 
     def _run_tool(
         self,
@@ -2474,6 +2550,7 @@ class QuasarDesktopApp(QMainWindow):
                 office_monitor,
                 self.mcp_manager,
                 self.max_tool_rounds,
+                self.tool_calling_mode,
             ),
             daemon=True,
         )
@@ -2490,6 +2567,7 @@ class QuasarDesktopApp(QMainWindow):
         office_monitor: agent.CliCollaborationMonitor | None = None,
         mcp_manager: agent.MCPServerManager | None = None,
         max_tool_rounds: int | None = None,
+        tool_calling_mode: str | None = None,
     ) -> None:
         try:
             try:
@@ -2519,6 +2597,7 @@ class QuasarDesktopApp(QMainWindow):
                     cancel_event=cancel_event,
                     office_context=office_context,
                     max_tool_rounds=max_tool_rounds,
+                    tool_calling_mode=tool_calling_mode,
                 )
             except InterruptedError:
                 self.signals.request_cancelled.emit()
@@ -3141,6 +3220,7 @@ class QuasarDesktopApp(QMainWindow):
             else:
                 self._close_mcp_manager(mcp_manager)
         agent.run_tool = self.original_run_tool
+        agent.tool_approval_callback = self.original_tool_approval_callback
         agent.alarm_notification_callback = (
             self.original_alarm_notification_callback
         )
@@ -3169,7 +3249,24 @@ class QuasarDesktopApp(QMainWindow):
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        set_app_user_model_id = ctypes.WinDLL(
+            "shell32",
+            use_last_error=True,
+        ).SetCurrentProcessExplicitAppUserModelID
+        set_app_user_model_id.argtypes = [ctypes.c_wchar_p]
+        set_app_user_model_id.restype = ctypes.c_long
+        result = set_app_user_model_id(WINDOWS_APP_USER_MODEL_ID)
+        if result != 0:
+            raise OSError(
+                result,
+                "Quasar 작업 표시줄 앱 ID를 설정하지 못했습니다.",
+            )
+
     app = QApplication([])
+    app.setApplicationName("Quasar")
+    app.setApplicationDisplayName("Quasar")
+    app.setWindowIcon(QIcon(str(Path(__file__).with_name("quasar_icon.png"))))
     window = QuasarDesktopApp()
     window.show()
     app.exec()

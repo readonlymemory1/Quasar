@@ -53,6 +53,7 @@ from office_documents import (
     load_office_document,
 )
 from todo_store import todo_store
+import quasar_tool_calling
 
 if platform.system() == "Windows":
     import winsound
@@ -71,6 +72,7 @@ browser_tab_owners: dict[str, str] = {}
 browser_next_tab_id = 1
 scheduled_jobs: list[dict[str, str]] = []
 alarm_notification_callback: Callable[[str], None] | None = None
+tool_approval_callback: Callable[[str, dict[str, Any]], bool] | None = None
 auto_approve_commands = True
 allow_python_run = False
 debug_mode = False
@@ -185,6 +187,58 @@ def get_max_tool_rounds(configured_value: int | None = None) -> int:
     ):
         raise ValueError("도구 반복 단계 수는 1에서 32 사이여야 합니다.")
     return configured_value
+
+
+def get_tool_calling_mode(configured_value: str | None = None) -> str:
+    if configured_value is None:
+        configured_value = os.getenv("QUASAR_TOOL_CALLING_MODE", "legacy")
+    return quasar_tool_calling.resolve_tool_calling_mode(configured_value)
+
+
+def _confirm_tool_action(name: str, arguments: dict[str, Any]) -> bool:
+    if name == "execute_cmd":
+        command = arguments.get("command", "")
+        if not isinstance(command, str) or not is_high_risk_command(command):
+            return True
+    elif name not in {"todo_delete", "schedule_command", "gmail_send"}:
+        return True
+
+    callback = tool_approval_callback
+    if callback is not None:
+        return callback(name, arguments)
+    if not sys.stdin.isatty():
+        return False
+    details = (
+        str(arguments.get("command", ""))
+        if name == "execute_cmd"
+        else json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    )
+    try:
+        approval = input(
+            f"\n위험 작업 승인 [{name}]> {details}\n실행할까요? [y/N]: "
+        ).strip().lower()
+    except EOFError:
+        return False
+    return approval in {"y", "yes"}
+
+
+HIGH_RISK_COMMAND_PATTERN = re.compile(
+    r"(?i)(?:^|[;&|()\s])(?:"
+    r"rm|rmdir|rd|ri|del|erase|remove-item|clear-content|set-content|out-file|"
+    r"move-item|format|diskpart|shutdown|restart-computer|stop-computer|"
+    r"set-executionpolicy|reg\s+(?:add|delete)|sc\s+(?:delete|config)|"
+    r"bcdedit|netsh|takeown|icacls|schtasks|net\s+user|"
+    r"git\s+(?:clean|restore|reset\s+--hard|push\s+.*--force)|"
+    r"docker\s+system\s+prune|chmod\s+-R|chown\s+-R|taskkill"
+    r")(?:$|[;&|()\s])"
+)
+
+
+def is_high_risk_command(command: str) -> bool:
+    return bool(
+        HIGH_RISK_COMMAND_PATTERN.search(command)
+        or re.search(r"(?<![<])>{1,2}\s*\S", command)
+    )
 
 
 def choose_provider(default_provider: str) -> str:
@@ -2723,6 +2777,50 @@ TOOLS = [
 ]
 
 
+def _available_tool_schemas(
+    mode: str,
+    loaded_categories: set[str],
+    active_mcp_names: set[str],
+    mcp_manager: MCPServerManager | None,
+) -> list[dict[str, Any]]:
+    if mode == quasar_tool_calling.LEGACY_MODE:
+        available = [
+            tool for tool in TOOLS
+            if tool["function"]["name"] != "discover_mcp_tools"
+            or (mcp_manager is not None and mcp_manager.tools)
+        ]
+    else:
+        dynamic_entry_names = {"end", "message_to_user"}
+        if mcp_manager is not None and mcp_manager.tools:
+            dynamic_entry_names.add("discover_mcp_tools")
+        if any(
+            tool["function"]["name"] == "set_tts_enabled"
+            for tool in TOOLS
+        ):
+            dynamic_entry_names.add("set_tts_enabled")
+        available = quasar_tool_calling.initial_tools(TOOLS, dynamic_entry_names)
+        available.extend(
+            quasar_tool_calling.tools_for_categories(TOOLS, loaded_categories)
+        )
+
+    if mcp_manager is not None:
+        available.extend(
+            schema
+            for schema in mcp_manager.tool_schemas()
+            if schema["function"]["name"] in active_mcp_names
+        )
+
+    unique_tools: dict[str, dict[str, Any]] = {}
+    for tool in available:
+        if (
+            tool["function"]["name"] == "discover_mcp_tools"
+            and (mcp_manager is None or not mcp_manager.tools)
+        ):
+            continue
+        unique_tools[tool["function"]["name"]] = tool
+    return list(unique_tools.values())
+
+
 def validate_user_message(arguments: dict[str, Any]) -> tuple[str, str]:
     message = arguments.get("message")
     kind = arguments.get("kind", "progress")
@@ -2741,6 +2839,13 @@ def run_tool(
     live_analysis_server: CliLiveAnalysisServer | None = None,
     mcp_manager: MCPServerManager | None = None,
 ) -> str | tuple[str, int, int]:
+    is_high_risk_action = name in {"todo_delete", "schedule_command", "gmail_send"}
+    if name == "execute_cmd":
+        command = arguments.get("command", "")
+        is_high_risk_action = isinstance(command, str) and is_high_risk_command(command)
+    if is_high_risk_action and not _confirm_tool_action(name, arguments):
+        return f"위험 작업 실행이 승인되지 않았습니다: {name}"
+
     if name == "message_to_user":
         try:
             message, kind = validate_user_message(arguments)
@@ -2785,7 +2890,7 @@ def run_tool(
         return f"알 수 없는 할 일 도구: {name}"
     if name == "execute_cmd":
         command = arguments.get("command", "")
-        if not auto_approve_commands:
+        if not auto_approve_commands and not is_high_risk_action:
             approval = input(f"\n명령 실행 승인 [{current_directory}]> {command}\n실행할까요? [y/N]: ").strip().lower()
             if approval not in {"y", "yes"}:
                 return "CMD 명령어 실행 승인이 거부되었습니다."
@@ -3096,9 +3201,11 @@ def request_agent(
     cancel_event: threading.Event | None = None,
     office_context: str = "",
     max_tool_rounds: int | None = None,
+    tool_calling_mode: str | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
     max_tool_rounds = get_max_tool_rounds(max_tool_rounds)
+    tool_calling_mode = get_tool_calling_mode(tool_calling_mode)
     saved_user_message: dict[str, Any] = {"role": "user", "content": user_input}
     working_user_message = saved_user_message
     current_document = (
@@ -3152,6 +3259,23 @@ def request_agent(
             system_message_index,
             {"role": "system", "content": office_context},
         )
+    if tool_calling_mode == quasar_tool_calling.DYNAMIC_MODE:
+        system_message_index = (
+            1 if working_messages and working_messages[0].get("role") == "system" else 0
+        )
+        working_messages.insert(
+            system_message_index,
+            {
+                "role": "system",
+                "content": (
+                    "도구는 카테고리별로 동적으로 제공됩니다. 먼저 list_tool_categories로 "
+                    "기능을 확인한 뒤 작업에 필요한 카테고리를 load_tool_categories 한 번에 "
+                    "여러 개 로드하세요. 작업 도중 필요한 카테고리를 추가로 로드할 수 있으며, "
+                    "이미 로드한 도구는 요청이 끝날 때까지 유지됩니다. 연결된 MCP 기능이 "
+                    "필요하면 discover_mcp_tools를 사용하세요."
+                ),
+            },
+        )
     working_messages.append(working_user_message)
     if is_responses_model(model):
         return request_agent_with_responses(
@@ -3166,22 +3290,19 @@ def request_agent(
             progress_callback,
             cancel_event,
             max_tool_rounds,
+            tool_calling_mode,
         )
 
     active_mcp_names: set[str] = set()
+    loaded_categories: set[str] = set()
     for _ in range(max_tool_rounds):
         _raise_if_cancelled(cancel_event)
-        available_tools = [
-            tool for tool in TOOLS
-            if tool["function"]["name"] != "discover_mcp_tools"
-            or (mcp_manager is not None and mcp_manager.tools)
-        ]
-        if mcp_manager is not None:
-            available_tools.extend(
-                schema
-                for schema in mcp_manager.tool_schemas()
-                if schema["function"]["name"] in active_mcp_names
-            )
+        available_tools = _available_tool_schemas(
+            tool_calling_mode,
+            loaded_categories,
+            active_mcp_names,
+            mcp_manager,
+        )
         print("\nThinking...", flush=True)
         if progress_callback is not None:
             progress_callback("요청을 분석하고 있습니다...")
@@ -3230,6 +3351,14 @@ def request_agent(
                     if progress_callback is not None:
                         progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
+                if tool_call.function.name == "list_tool_categories":
+                    result = quasar_tool_calling.get_category_names()
+                elif tool_call.function.name == "load_tool_categories":
+                    result = quasar_tool_calling.load_categories(
+                        arguments.get("categories"),
+                        loaded_categories,
+                        TOOLS,
+                    )
                 if tool_call.function.name == "discover_mcp_tools":
                     if mcp_manager is None:
                         result = "No MCP server is configured."
@@ -3247,7 +3376,10 @@ def request_agent(
                             if discovered
                             else "No matching MCP tools found. Try a different English query."
                         )
-                else:
+                elif tool_call.function.name not in {
+                    "list_tool_categories",
+                    "load_tool_categories",
+                }:
                     result = run_tool(
                         tool_call.function.name,
                         arguments,
@@ -3306,23 +3438,21 @@ def request_agent_with_responses(
     progress_callback: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
     max_tool_rounds: int | None = None,
+    tool_calling_mode: str | None = None,
 ) -> str:
     max_tool_rounds = get_max_tool_rounds(max_tool_rounds)
+    tool_calling_mode = get_tool_calling_mode(tool_calling_mode)
     response_input = to_responses_input(working_messages)
     active_mcp_names: set[str] = set()
+    loaded_categories: set[str] = set()
     for _ in range(max_tool_rounds):
         _raise_if_cancelled(cancel_event)
-        available_tools = [
-            tool for tool in TOOLS
-            if tool["function"]["name"] != "discover_mcp_tools"
-            or (mcp_manager is not None and mcp_manager.tools)
-        ]
-        if mcp_manager is not None:
-            available_tools.extend(
-                schema
-                for schema in mcp_manager.tool_schemas()
-                if schema["function"]["name"] in active_mcp_names
-            )
+        available_tools = _available_tool_schemas(
+            tool_calling_mode,
+            loaded_categories,
+            active_mcp_names,
+            mcp_manager,
+        )
         print("\nThinking...", flush=True)
         if progress_callback is not None:
             progress_callback("요청을 분석하고 있습니다...")
@@ -3377,6 +3507,14 @@ def request_agent_with_responses(
                     if progress_callback is not None:
                         progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
+                if tool_call.name == "list_tool_categories":
+                    result = quasar_tool_calling.get_category_names()
+                elif tool_call.name == "load_tool_categories":
+                    result = quasar_tool_calling.load_categories(
+                        arguments.get("categories"),
+                        loaded_categories,
+                        TOOLS,
+                    )
                 if tool_call.name == "discover_mcp_tools":
                     if mcp_manager is None:
                         result = "No MCP server is configured."
@@ -3394,7 +3532,10 @@ def request_agent_with_responses(
                             if discovered
                             else "No matching MCP tools found. Try a different English query."
                         )
-                else:
+                elif tool_call.name not in {
+                    "list_tool_categories",
+                    "load_tool_categories",
+                }:
                     result = run_tool(
                         tool_call.name,
                         arguments,
@@ -3463,6 +3604,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-model-prompt", action="store_true", help="시작 시 공급자/모델 선택을 건너뜀")
     parser.add_argument("--cwd", help="시작 작업 디렉터리")
     parser.add_argument("--confirm-commands", action="store_true", help="각 시스템 명령 실행 전에 확인")
+    parser.add_argument(
+        "--tool-calling-mode",
+        choices=quasar_tool_calling.TOOL_CALLING_MODES,
+        help="도구 호출 방식 (기본값: QUASAR_TOOL_CALLING_MODE 또는 legacy)",
+    )
     parser.add_argument(
         "--mcp-config",
         help="MCP 서버 설정 JSON 파일 (기본값: 작업 폴더의 .mcp.json, 없으면 CLI 폴더의 .mcp.json)",
@@ -3677,6 +3823,7 @@ def main(argv: list[str] | None = None) -> None:
                     user_input,
                     live_analysis_server,
                     mcp_manager,
+                    tool_calling_mode=args.tool_calling_mode,
                 )
                 print_markdown_response(answer)
             except Exception as error:

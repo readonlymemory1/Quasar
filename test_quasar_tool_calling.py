@@ -1,0 +1,243 @@
+import os
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import quasar_cli
+import quasar_tool_calling
+
+
+def chat_tool_call(name: str, arguments: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=f"call-{name}",
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def chat_tool_response(*tool_calls: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=list(tool_calls),
+                    model_dump=lambda **_kwargs: {
+                        "role": "assistant",
+                        "tool_calls": [],
+                    },
+                )
+            )
+        ]
+    )
+
+
+class ToolCallingModeTests(unittest.TestCase):
+    def test_mode_defaults_to_legacy_and_reads_environment(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(quasar_cli.get_tool_calling_mode(), "legacy")
+        with patch.dict(os.environ, {"QUASAR_TOOL_CALLING_MODE": "dynamic"}):
+            self.assertEqual(quasar_cli.get_tool_calling_mode(), "dynamic")
+
+    def test_mode_rejects_unknown_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "legacy.*dynamic"):
+            quasar_cli.get_tool_calling_mode("automatic")
+
+    def test_dynamic_catalog_adds_categories_without_dropping_loaded_tools(self) -> None:
+        loaded_categories: set[str] = set()
+        categories_result = quasar_tool_calling.load_categories(
+            ["code", "files"],
+            loaded_categories,
+            quasar_cli.TOOLS,
+        )
+        self.assertIn("코드", categories_result)
+        self.assertIn("파일", categories_result)
+        available = quasar_tool_calling.tools_for_categories(
+            quasar_cli.TOOLS,
+            loaded_categories,
+        )
+        names = {tool["function"]["name"] for tool in available}
+        self.assertTrue({"python_check_syntax", "read_workspace_file"} <= names)
+        self.assertNotIn("web_search", names)
+
+        quasar_tool_calling.load_categories(
+            ["web"],
+            loaded_categories,
+            quasar_cli.TOOLS,
+        )
+        names = {
+            tool["function"]["name"]
+            for tool in quasar_tool_calling.tools_for_categories(
+                quasar_cli.TOOLS,
+                loaded_categories,
+            )
+        }
+        self.assertTrue({"python_check_syntax", "read_workspace_file", "web_search"} <= names)
+
+    def test_invalid_category_does_not_change_loaded_state(self) -> None:
+        loaded_categories: set[str] = set()
+        result = quasar_tool_calling.load_categories(
+            ["unknown"],
+            loaded_categories,
+            quasar_cli.TOOLS,
+        )
+        self.assertIn("알 수 없는 카테고리", result)
+        self.assertEqual(loaded_categories, set())
+
+    def test_legacy_mode_keeps_existing_full_tool_list(self) -> None:
+        available = quasar_cli._available_tool_schemas(
+            "legacy",
+            set(),
+            set(),
+            None,
+        )
+        available_names = {tool["function"]["name"] for tool in available}
+        expected_names = {
+            tool["function"]["name"]
+            for tool in quasar_cli.TOOLS
+            if tool["function"]["name"] != "discover_mcp_tools"
+        }
+        self.assertEqual(available_names, expected_names)
+        self.assertNotIn("load_tool_categories", available_names)
+
+    def test_chat_api_starts_with_entry_tools_then_loads_selected_categories(self) -> None:
+        load_call = chat_tool_call(
+            "load_tool_categories",
+            '{"categories":["code"]}',
+        )
+        run_call = chat_tool_call("python_check_syntax", '{"file_path":"sample.py"}')
+        responses = iter([
+            chat_tool_response(load_call),
+            chat_tool_response(run_call),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="완료", tool_calls=[])
+                    )
+                ]
+            ),
+        ])
+        create = Mock(side_effect=lambda **_kwargs: next(responses))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create)
+            )
+        )
+
+        with (
+            patch.object(quasar_cli, "is_responses_model", return_value=False),
+            patch.object(quasar_cli, "run_tool", return_value="syntax ok") as run_tool,
+            patch("sys.stdout"),
+        ):
+            answer = quasar_cli.request_agent(
+                client,
+                "test-model",
+                [],
+                "sample.py 문법 검사",
+                tool_calling_mode="dynamic",
+            )
+
+        self.assertEqual(answer, "완료")
+        run_tool.assert_called_once()
+        calls = create.call_args_list
+        initial_names = {
+            tool["function"]["name"] for tool in calls[0].kwargs["tools"]
+        }
+        selected_names = {
+            tool["function"]["name"] for tool in calls[1].kwargs["tools"]
+        }
+        self.assertEqual(
+            initial_names,
+            {
+                "list_tool_categories",
+                "load_tool_categories",
+                "message_to_user",
+                "end",
+            },
+        )
+        self.assertIn("python_check_syntax", selected_names)
+        self.assertNotIn("web_search", selected_names)
+
+    def test_responses_api_uses_dynamic_tool_schemas(self) -> None:
+        load_call = SimpleNamespace(
+            type="function_call",
+            call_id="call-load",
+            name="load_tool_categories",
+            arguments='{"categories":["calendar"]}',
+            model_dump=lambda **_kwargs: {
+                "type": "function_call",
+                "call_id": "call-load",
+                "name": "load_tool_categories",
+                "arguments": '{"categories":["calendar"]}',
+            },
+        )
+        final_response = SimpleNamespace(output=[], output_text="완료")
+        create = Mock(side_effect=[
+            SimpleNamespace(output=[load_call], output_text=""),
+            final_response,
+        ])
+        client = SimpleNamespace(responses=SimpleNamespace(create=create))
+
+        with (
+            patch.object(quasar_cli, "is_responses_model", return_value=True),
+            patch.object(quasar_cli, "to_responses_input", return_value=[]),
+            patch("sys.stdout"),
+        ):
+            answer = quasar_cli.request_agent(
+                client,
+                "test-responses-model",
+                [],
+                "지금 시각 확인",
+                tool_calling_mode="dynamic",
+            )
+
+        self.assertEqual(answer, "완료")
+        initial_names = {tool["name"] for tool in create.call_args_list[0].kwargs["tools"]}
+        loaded_names = {tool["name"] for tool in create.call_args_list[1].kwargs["tools"]}
+        self.assertIn("load_tool_categories", initial_names)
+        self.assertIn("get_current_time", loaded_names)
+        self.assertNotIn("web_search", loaded_names)
+
+
+class HighRiskCommandApprovalTests(unittest.TestCase):
+    def test_high_risk_command_requires_approval_even_when_auto_approve_is_enabled(self) -> None:
+        with (
+            patch.object(quasar_cli, "auto_approve_commands", True),
+            patch.object(quasar_cli, "tool_approval_callback", return_value=False),
+            patch.object(quasar_cli, "execute_cmd") as execute_cmd,
+        ):
+            result = quasar_cli.run_tool(
+                "execute_cmd",
+                {"command": "Remove-Item -Recurse C:\\temp\\data"},
+            )
+
+        self.assertIn("승인되지 않았습니다", result)
+        execute_cmd.assert_not_called()
+
+    def test_approved_high_risk_command_executes(self) -> None:
+        with (
+            patch.object(quasar_cli, "auto_approve_commands", True),
+            patch.object(quasar_cli, "tool_approval_callback", return_value=True),
+            patch.object(quasar_cli, "execute_cmd", return_value="done") as execute_cmd,
+        ):
+            result = quasar_cli.run_tool(
+                "execute_cmd",
+                {"command": "Remove-Item -Recurse C:\\temp\\data"},
+            )
+
+        self.assertEqual(result, "done")
+        execute_cmd.assert_called_once()
+
+    def test_non_destructive_command_does_not_require_risk_approval(self) -> None:
+        with (
+            patch.object(quasar_cli, "auto_approve_commands", True),
+            patch.object(quasar_cli, "tool_approval_callback", side_effect=AssertionError),
+            patch.object(quasar_cli, "execute_cmd", return_value="done"),
+        ):
+            self.assertEqual(
+                quasar_cli.run_tool("execute_cmd", {"command": "python --version"}),
+                "done",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
