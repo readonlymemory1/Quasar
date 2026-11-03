@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QFileDialog,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -72,6 +74,13 @@ SYSTEM_PROMPT = (
     "Send email only when explicitly requested, and clarify ambiguous requests first. "
     "For browser tasks, navigate to the requested page once, then continue interacting with the current page. "
     "Do not navigate to or reload the same URL again unless the user explicitly asks to refresh or revisit it. "
+    "Before interacting with a web page, inspect its DOM using the browser snapshot or page-evaluation tools. "
+    "If the DOM does not provide enough information to understand the page or choose a target, take and inspect a screenshot "
+    "before acting. Reinspect the DOM after navigation or a meaningful page-state change before continuing. "
+    "When needed, discover browser tools with an English query mentioning DOM snapshot, page evaluation, and screenshot. "
+    "When asked to create or edit a PowerPoint presentation, discover and use the connected PowerPoint MCP tools "
+    "with an English query such as 'create and build PowerPoint presentations, slides, pptx files'. "
+    "Do not claim PowerPoint generation is unavailable unless tool discovery or execution confirms that it is. "
     "Do not claim success until you have verified the tool result."
 )
 
@@ -96,6 +105,7 @@ class AppSignals(QObject):
     request_cancelled = Signal()
     request_failed = Signal(str)
     request_progress = Signal(str)
+    agent_message = Signal(str, str)
     models_loaded = Signal(str, object, object)
     voice_status = Signal(str)
     voice_text_ready = Signal(str)
@@ -1380,14 +1390,17 @@ class QuasarDesktopApp(QMainWindow):
         self.office_monitor: agent.CliCollaborationMonitor | None = None
         self.office_monitor_client: Any = None
         self.office_monitor_source: _OfficeDocumentSource | None = None
+        self.mcp_manager: agent.MCPServerManager | None = None
+        self.mcp_startup_error: str | None = None
         self.microphone_notice: str | None = None
         self.microphone_device_index = self._restore_microphone_selection()
         self.busy = False
+        self.worker_thread: threading.Thread | None = None
         self.closing = False
         self.request_cancel_pending = False
         self.request_cancel_event: threading.Event | None = None
         self.request_client: Any = None
-        self.activity_body: QLabel | None = None
+        self.last_activity_message: str | None = None
         self.voice_recognizer = LocalSpeechRecognizer()
         self.voice_recording = False
         self.voice_processing = False
@@ -1410,6 +1423,7 @@ class QuasarDesktopApp(QMainWindow):
         self.signals.request_cancelled.connect(self._finish_cancelled_request)
         self.signals.request_failed.connect(self._finish_with_error)
         self.signals.request_progress.connect(self._show_request_progress)
+        self.signals.agent_message.connect(self._show_agent_message)
         self.signals.models_loaded.connect(self._apply_model_options)
         self.signals.voice_status.connect(self._show_voice_status)
         self.signals.voice_text_ready.connect(self._submit_voice_text)
@@ -1512,6 +1526,11 @@ class QuasarDesktopApp(QMainWindow):
             "저장된 Word/PPT/메모장 텍스트 파일을 공동작업 목록에 등록합니다."
         )
         header.addWidget(self.office_watch_button)
+        self.checklist_button = QPushButton("체크리스트 열기")
+        self.checklist_button.setMinimumHeight(40)
+        self.checklist_button.setCheckable(True)
+        self.checklist_button.toggled.connect(self._set_checklist_visible)
+        header.addWidget(self.checklist_button)
         layout.addWidget(top_bar)
 
         self.status_label = QLabel()
@@ -1560,6 +1579,9 @@ class QuasarDesktopApp(QMainWindow):
         self.chat_scroll.setObjectName("chatScroll")
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setWidget(self.chat_container)
+        self.chat_scroll.verticalScrollBar().rangeChanged.connect(
+            self._scroll_chat_to_bottom
+        )
 
         conversation_row = QHBoxLayout()
         conversation_row.setSpacing(16)
@@ -1594,6 +1616,31 @@ class QuasarDesktopApp(QMainWindow):
         conversation_layout.setContentsMargins(1, 1, 1, 1)
         conversation_layout.addWidget(self.chat_scroll)
         conversation_row.addWidget(conversation_panel, 1)
+
+        self.checklist_panel = QFrame()
+        self.checklist_panel.setObjectName("assistantPanel")
+        self.checklist_panel.setFixedWidth(280)
+        checklist_layout = QVBoxLayout(self.checklist_panel)
+        checklist_layout.setContentsMargins(14, 14, 14, 14)
+        checklist_header = QHBoxLayout()
+        checklist_title = QLabel("체크리스트")
+        checklist_title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        checklist_header.addWidget(checklist_title)
+        checklist_header.addStretch(1)
+        self.checklist_refresh_button = QPushButton("새로고침")
+        self.checklist_refresh_button.clicked.connect(self._refresh_checklist)
+        checklist_header.addWidget(self.checklist_refresh_button)
+        checklist_layout.addLayout(checklist_header)
+        self.checklist_status = QLabel()
+        self.checklist_status.setWordWrap(True)
+        self.checklist_status.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        checklist_layout.addWidget(self.checklist_status)
+        self.checklist_list = QListWidget()
+        self.checklist_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.checklist_list.itemChanged.connect(self._set_checklist_item_completed)
+        checklist_layout.addWidget(self.checklist_list, 1)
+        self.checklist_panel.hide()
+        conversation_row.addWidget(self.checklist_panel)
         layout.addLayout(conversation_row, 1)
 
         composer_row = QHBoxLayout()
@@ -1923,6 +1970,8 @@ class QuasarDesktopApp(QMainWindow):
             return
         if self.microphone_notice:
             status = f"{status} · {self.microphone_notice}"
+        if self.mcp_startup_error:
+            status = f"{status} · {self.mcp_startup_error}"
         self.status_label.setText(status)
 
     def _ensure_office_monitor(self) -> agent.CliCollaborationMonitor:
@@ -2247,6 +2296,17 @@ class QuasarDesktopApp(QMainWindow):
         agent.current_directory = Path(__file__).resolve().parent
         agent.auto_approve_commands = True
         agent.run_tool = self._run_tool
+        mcp_config_path = agent.resolve_mcp_config_path(
+            None,
+            agent.current_directory,
+            Path(__file__).resolve().parent,
+        )
+        try:
+            self.mcp_manager = agent.MCPServerManager(mcp_config_path)
+        except (OSError, ValueError) as error:
+            self.mcp_startup_error = (
+                f"MCP 설정을 읽지 못했습니다 ({mcp_config_path}): {error}"
+            )
 
     def _run_tool(
         self,
@@ -2263,8 +2323,7 @@ class QuasarDesktopApp(QMainWindow):
             return f"Quasar spoken responses {'enabled' if enabled else 'disabled'}."
         if name == "message_to_user":
             message, kind = agent.validate_user_message(arguments)
-            label = "오류 및 복구" if kind == "error" else "진행 상황"
-            self.signals.request_progress.emit(f"{label}: {message}")
+            self.signals.agent_message.emit(message, kind)
             return "메시지를 사용자 채팅에 표시했습니다."
         return self.original_run_tool(
             name,
@@ -2337,11 +2396,9 @@ class QuasarDesktopApp(QMainWindow):
         self._add_message("user", prompt)
         if office_monitor_error:
             self._add_message("assistant", office_monitor_error)
-        _activity_bubble, self.activity_body = self._add_message(
-            "assistant",
-            "요청을 분석하고 있습니다...",
-            streaming=True,
-        )
+        self.last_activity_message = None
+        self._add_activity_message("요청을 분석하고 있습니다...")
+        self.status_label.setText("요청을 분석하고 있습니다...")
         request_messages = list(self.messages)
         cancel_event = threading.Event()
         self.request_cancel_event = cancel_event
@@ -2359,6 +2416,7 @@ class QuasarDesktopApp(QMainWindow):
                 request_messages,
                 cancel_event,
                 office_monitor,
+                self.mcp_manager,
             ),
             daemon=True,
         )
@@ -2373,6 +2431,7 @@ class QuasarDesktopApp(QMainWindow):
         messages: list[dict[str, Any]],
         cancel_event: threading.Event,
         office_monitor: agent.CliCollaborationMonitor | None = None,
+        mcp_manager: agent.MCPServerManager | None = None,
     ) -> None:
         try:
             try:
@@ -2397,7 +2456,7 @@ class QuasarDesktopApp(QMainWindow):
                     messages,
                     prompt,
                     live_analysis_server=None,
-                    mcp_manager=None,
+                    mcp_manager=mcp_manager,
                     progress_callback=self.signals.request_progress.emit,
                     cancel_event=cancel_event,
                     office_context=office_context,
@@ -2449,8 +2508,7 @@ class QuasarDesktopApp(QMainWindow):
         self.status_label.setText(
             "응답 중지를 요청했습니다. 실행 중인 도구는 완료될 수 있습니다."
         )
-        if self.activity_body is not None:
-            self.activity_body.setText("응답을 중지하고 있습니다...")
+        self.status_label.setText("응답을 중지하고 있습니다...")
         if self.request_client is not None:
             try:
                 self.request_client.close()
@@ -2740,13 +2798,19 @@ class QuasarDesktopApp(QMainWindow):
     def _show_request_progress(self, progress: str) -> None:
         if self.closing or self.request_cancel_pending:
             return
-        if self.activity_body is not None:
-            current_text = self.activity_body.text()
-            self.activity_body.setText(f"{current_text}\n{progress}")
-            self.chat_scroll.verticalScrollBar().setValue(
-                self.chat_scroll.verticalScrollBar().maximum()
-            )
+        self._add_activity_message(progress)
         self.status_label.setText(progress)
+
+    def _show_agent_message(self, message: str, kind: str) -> None:
+        if self.closing or self.request_cancel_pending:
+            return
+        self.last_activity_message = None
+        content = (
+            f"**오류 및 복구**\n\n{message}"
+            if kind == "error"
+            else message
+        )
+        self._add_message("assistant", content)
 
     def _finish_with_response(
         self,
@@ -2757,7 +2821,6 @@ class QuasarDesktopApp(QMainWindow):
             return
         self.messages[:] = request_messages
         self._clear_request_state()
-        self.activity_body = None
         self._add_message("assistant", response)
         self._set_busy(False)
         if self.voice_response_toggle.isChecked():
@@ -2772,7 +2835,6 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self._clear_request_state()
-        self.activity_body = None
         self._add_message("assistant", f"요청 처리 실패: {error}")
         self._set_busy(False)
         if self._start_next_pending_speech():
@@ -2784,9 +2846,7 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self._clear_request_state()
-        if self.activity_body is not None:
-            self.activity_body.setText("응답 생성을 중지했습니다.")
-        self.activity_body = None
+        self.status_label.setText("응답 생성을 중지했습니다.")
         self._set_busy(False)
         if self._start_next_pending_speech():
             return
@@ -2866,10 +2926,88 @@ class QuasarDesktopApp(QMainWindow):
             row.addStretch(1)
             row.addWidget(bubble)
         self.chat_layout.insertLayout(self.chat_layout.count() - 1, row)
-        self.chat_scroll.verticalScrollBar().setValue(
-            self.chat_scroll.verticalScrollBar().maximum()
-        )
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
         return bubble, body
+
+    def _add_activity_message(self, content: str) -> None:
+        if self.last_activity_message == content:
+            return
+        self.last_activity_message = content
+
+        message = QLabel(content)
+        message.setObjectName("activityMessage")
+        message.setWordWrap(True)
+        message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        message.setStyleSheet(
+            f"color: {MUTED}; font-size: 12px; padding: 2px 6px;"
+        )
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(message)
+        row.addStretch(1)
+        self.chat_layout.insertLayout(self.chat_layout.count() - 1, row)
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
+
+    def _scroll_chat_to_bottom(self, *_range: int) -> None:
+        scrollbar = self.chat_scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _set_checklist_visible(self, visible: bool) -> None:
+        self.checklist_panel.setVisible(visible)
+        self.checklist_button.setText(
+            "체크리스트 닫기" if visible else "체크리스트 열기"
+        )
+        if visible:
+            self._refresh_checklist()
+
+    def _refresh_checklist(self) -> None:
+        was_blocked = self.checklist_list.blockSignals(True)
+        try:
+            tasks = agent.todo_store.list_tasks("all")
+            self.checklist_list.clear()
+            for task in tasks:
+                item = QListWidgetItem(task["title"])
+                item.setData(Qt.ItemDataRole.UserRole, task["id"])
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if task["completed"]
+                    else Qt.CheckState.Unchecked
+                )
+                self.checklist_list.addItem(item)
+            self.checklist_status.setText(
+                f"할 일 {len(tasks)}개"
+                if tasks
+                else "등록된 체크리스트가 없습니다."
+            )
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            self.checklist_list.clear()
+            self.checklist_status.setText(
+                f"체크리스트를 불러오지 못했습니다: {error}"
+            )
+        finally:
+            self.checklist_list.blockSignals(was_blocked)
+
+    def _set_checklist_item_completed(self, item: QListWidgetItem) -> None:
+        task_id = item.data(Qt.ItemDataRole.UserRole)
+        if task_id is None:
+            return
+        completed = item.checkState() == Qt.CheckState.Checked
+        try:
+            agent.todo_store.update_task(task_id, {"completed": completed})
+        except (KeyError, OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            self.checklist_status.setText(
+                f"체크리스트 변경 실패: {error}"
+            )
+            self._refresh_checklist()
+            return
+        self._refresh_checklist()
 
     def closeEvent(self, event: Any) -> None:
         if self.busy:
@@ -2907,10 +3045,40 @@ class QuasarDesktopApp(QMainWindow):
         if self.speech_worker is not None:
             self.speech_worker.stop()
         self.voice_recognizer.close()
+        if self.mcp_manager is not None:
+            mcp_manager = self.mcp_manager
+            self.mcp_manager = None
+            if self.busy and self.worker_thread is not None:
+                threading.Thread(
+                    target=self._close_mcp_manager_after_worker,
+                    args=(self.worker_thread, mcp_manager),
+                    daemon=True,
+                ).start()
+            else:
+                self._close_mcp_manager(mcp_manager)
         agent.run_tool = self.original_run_tool
         if self.tts_tool_schema in agent.TOOLS:
             agent.TOOLS.remove(self.tts_tool_schema)
         event.accept()
+
+    @staticmethod
+    def _close_mcp_manager_after_worker(
+        worker: threading.Thread,
+        mcp_manager: agent.MCPServerManager,
+    ) -> None:
+        worker.join()
+        QuasarDesktopApp._close_mcp_manager(mcp_manager)
+
+    @staticmethod
+    def _close_mcp_manager(mcp_manager: agent.MCPServerManager) -> None:
+        try:
+            mcp_manager.close()
+        except Exception as error:
+            print(
+                f"MCP 연결 종료 실패: {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def main() -> None:

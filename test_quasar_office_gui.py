@@ -10,6 +10,124 @@ import Quasar
 
 
 class OfficeMonitorGuiTests(unittest.TestCase):
+    def test_checklist_panel_toggle_refreshes_shared_tasks(self) -> None:
+        app = SimpleNamespace(
+            checklist_panel=Mock(),
+            checklist_button=Mock(),
+            _refresh_checklist=Mock(),
+        )
+
+        Quasar.QuasarDesktopApp._set_checklist_visible(app, True)
+
+        app.checklist_panel.setVisible.assert_called_once_with(True)
+        app.checklist_button.setText.assert_called_once_with("체크리스트 닫기")
+        app._refresh_checklist.assert_called_once_with()
+
+    def test_checklist_completion_updates_shared_todo_store(self) -> None:
+        item = Mock()
+        item.data.return_value = 17
+        item.checkState.return_value = Quasar.Qt.CheckState.Checked
+        app = SimpleNamespace(
+            checklist_status=Mock(),
+            _refresh_checklist=Mock(),
+        )
+
+        with patch.object(Quasar.agent.todo_store, "update_task") as update_task:
+            Quasar.QuasarDesktopApp._set_checklist_item_completed(app, item)
+
+        update_task.assert_called_once_with(17, {"completed": True})
+        app._refresh_checklist.assert_called_once_with()
+
+    def test_chat_scrolls_to_bottom_after_layout_is_updated(self) -> None:
+        scrollbar = Mock()
+        scrollbar.maximum.return_value = 420
+        app = SimpleNamespace(
+            chat_scroll=SimpleNamespace(
+                verticalScrollBar=Mock(return_value=scrollbar),
+            ),
+        )
+
+        Quasar.QuasarDesktopApp._scroll_chat_to_bottom(app, 0, 420)
+
+        scrollbar.setValue.assert_called_once_with(420)
+
+    def test_request_progress_updates_status_without_creating_chat_bubble(self) -> None:
+        app = SimpleNamespace(
+            closing=False,
+            request_cancel_pending=False,
+            status_label=Mock(),
+            _add_activity_message=Mock(),
+        )
+
+        Quasar.QuasarDesktopApp._show_request_progress(
+            app,
+            "도구 실행 중: 사용자 메시지 전송",
+        )
+
+        app.status_label.setText.assert_called_once_with(
+            "도구 실행 중: 사용자 메시지 전송"
+        )
+        app._add_activity_message.assert_called_once_with(
+            "도구 실행 중: 사용자 메시지 전송"
+        )
+
+    def test_activity_message_is_plain_text_and_consecutive_duplicates_are_skipped(self) -> None:
+        layout = Mock()
+        layout.count.return_value = 1
+        row = Mock()
+        activity_label = Mock()
+        app = SimpleNamespace(
+            last_activity_message=None,
+            chat_layout=layout,
+            _scroll_chat_to_bottom=Mock(),
+        )
+
+        with (
+            patch.object(
+                Quasar,
+                "QLabel",
+                return_value=activity_label,
+            ) as create_label,
+            patch.object(Quasar, "QHBoxLayout", return_value=row),
+            patch.object(Quasar.QTimer, "singleShot") as schedule_scroll,
+        ):
+            Quasar.QuasarDesktopApp._add_activity_message(
+                app,
+                "도구 실행 중: web_click",
+            )
+            Quasar.QuasarDesktopApp._add_activity_message(
+                app,
+                "도구 실행 중: web_click",
+            )
+        layout.insertLayout.assert_called_once()
+        layout.insertLayout.assert_called_once()
+        self.assertEqual(layout.insertLayout.call_args.args[1], row)
+        create_label.assert_called_once_with("도구 실행 중: web_click")
+        activity_label.setObjectName.assert_called_once_with("activityMessage")
+        row.addWidget.assert_called_once_with(activity_label)
+        self.assertEqual(schedule_scroll.call_count, 1)
+
+    def test_agent_progress_and_error_messages_use_chat_bubbles(self) -> None:
+        app = SimpleNamespace(
+            closing=False,
+            request_cancel_pending=False,
+            _add_message=Mock(),
+        )
+
+        Quasar.QuasarDesktopApp._show_agent_message(app, "작업 중입니다.", "progress")
+        Quasar.QuasarDesktopApp._show_agent_message(app, "확인 중입니다.", "error")
+
+        self.assertEqual(
+            app._add_message.call_args_list,
+            [
+                unittest.mock.call("assistant", "작업 중입니다."),
+                unittest.mock.call(
+                    "assistant",
+                    "**오류 및 복구**\n\n확인 중입니다.",
+                ),
+            ],
+        )
+
     def test_chat_restores_persisted_office_watchlist_on_demand(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
@@ -38,6 +156,7 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             [],
             1,
         )
+        mcp_manager = Mock()
         client = Mock()
         signals = SimpleNamespace(
             request_progress=Mock(),
@@ -60,6 +179,7 @@ class OfficeMonitorGuiTests(unittest.TestCase):
                 [{"role": "system", "content": "system prompt"}],
                 threading.Event(),
                 monitor,
+                mcp_manager,
             )
 
         monitor.office_chat_context.assert_called_once_with()
@@ -70,6 +190,7 @@ class OfficeMonitorGuiTests(unittest.TestCase):
             request_agent.call_args.kwargs["office_context"],
             "\n[연결 문서]\n중요한 사실",
         )
+        self.assertIs(request_agent.call_args.kwargs["mcp_manager"], mcp_manager)
         signals.response_ready.emit.assert_called_once_with(
             "답변",
             [{"role": "system", "content": "system prompt"}],
