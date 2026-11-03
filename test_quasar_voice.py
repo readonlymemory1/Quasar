@@ -185,6 +185,31 @@ class VoiceWorkerTests(unittest.TestCase):
             for worker in workers:
                 worker.join(timeout=1)
 
+    def test_request_worker_forwards_configured_tool_round_limit(self) -> None:
+        client = Mock()
+        signals = types.SimpleNamespace(
+            request_progress=types.SimpleNamespace(emit=Mock()),
+            request_cancelled=types.SimpleNamespace(emit=Mock()),
+            request_failed=types.SimpleNamespace(emit=Mock()),
+            response_ready=types.SimpleNamespace(emit=Mock()),
+        )
+        app = types.SimpleNamespace(signals=signals)
+
+        with patch.object(Quasar.agent, "request_agent", return_value="완료") as request:
+            Quasar.QuasarDesktopApp._request_response(
+                app,
+                client,
+                "test-model",
+                "테스트 요청",
+                [],
+                threading.Event(),
+                max_tool_rounds=3,
+            )
+
+        self.assertEqual(request.call_args.kwargs["max_tool_rounds"], 3)
+        signals.response_ready.emit.assert_called_once()
+        client.close.assert_called_once()
+
     def test_capture_is_transcribed_locally_as_korean(self) -> None:
         captured: list[np.ndarray] = []
         errors: list[str] = []

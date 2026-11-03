@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -163,6 +164,7 @@ class MicrophoneSettingsDialog(QDialog):
     def __init__(
         self,
         selected_device_index: int | None,
+        max_tool_rounds: int,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -173,6 +175,17 @@ class MicrophoneSettingsDialog(QDialog):
         form = QFormLayout()
         self.microphone_selector = QComboBox()
         form.addRow("입력 마이크", self.microphone_selector)
+        self.tool_rounds_selector = QSpinBox()
+        self.tool_rounds_selector.setRange(
+            agent.MIN_TOOL_ROUNDS,
+            agent.MAX_TOOL_ROUNDS,
+        )
+        self.tool_rounds_selector.setValue(max_tool_rounds)
+        self.tool_rounds_selector.setSuffix(" 단계")
+        self.tool_rounds_selector.setToolTip(
+            "요청에서 도구를 호출하고 결과를 반영하는 최대 반복 횟수"
+        )
+        form.addRow("도구 반복 한도", self.tool_rounds_selector)
         layout.addLayout(form)
 
         self.microphone_status = QLabel()
@@ -244,6 +257,10 @@ class MicrophoneSettingsDialog(QDialog):
     @property
     def selected_device_name(self) -> str:
         return self.microphone_selector.currentText()
+
+    @property
+    def max_tool_rounds(self) -> int:
+        return self.tool_rounds_selector.value()
 
     def _toggle_audio_test_recording(self) -> None:
         if self.audio_test_worker is not None and self.audio_test_worker.is_alive():
@@ -1390,6 +1407,14 @@ class QuasarDesktopApp(QMainWindow):
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         self.settings = QSettings("Quasar", "Quasar")
+        self.tool_rounds_error: str | None = None
+        try:
+            self.max_tool_rounds = agent.get_max_tool_rounds(
+                self.settings.value("agent/max_tool_rounds", None, type=int)
+            )
+        except ValueError as error:
+            self.max_tool_rounds = agent.DEFAULT_MAX_TOOL_ROUNDS
+            self.tool_rounds_error = str(error)
         self.office_monitor: agent.CliCollaborationMonitor | None = None
         self.office_monitor_client: Any = None
         self.office_monitor_source: _OfficeDocumentSource | None = None
@@ -1845,6 +1870,7 @@ class QuasarDesktopApp(QMainWindow):
     def _open_settings(self) -> None:
         dialog = MicrophoneSettingsDialog(
             self.microphone_device_index,
+            self.max_tool_rounds,
             self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1893,6 +1919,10 @@ class QuasarDesktopApp(QMainWindow):
             if selected_device_index is not None
             else -1,
         )
+        self.settings.setValue(
+            "agent/max_tool_rounds",
+            dialog.max_tool_rounds,
+        )
         if selected_device is None:
             self.settings.remove("audio/input_device_name")
             self.settings.remove("audio/input_device_host_api")
@@ -1919,6 +1949,8 @@ class QuasarDesktopApp(QMainWindow):
             )
             return
         self.microphone_device_index = selected_device_index
+        self.max_tool_rounds = dialog.max_tool_rounds
+        self.tool_rounds_error = None
         self.microphone_notice = None
         self.status_label.setText(
             f"입력 마이크: {dialog.selected_device_name}"
@@ -1980,6 +2012,11 @@ class QuasarDesktopApp(QMainWindow):
             status = f"{status} · {self.microphone_notice}"
         if self.mcp_startup_error:
             status = f"{status} · {self.mcp_startup_error}"
+        if self.tool_rounds_error:
+            status = (
+                f"{status} · 도구 반복 한도 설정 오류: {self.tool_rounds_error} "
+                f"(기본값 {self.max_tool_rounds} 사용)"
+            )
         self.status_label.setText(status)
 
     def _ensure_office_monitor(self) -> agent.CliCollaborationMonitor:
@@ -2436,6 +2473,7 @@ class QuasarDesktopApp(QMainWindow):
                 cancel_event,
                 office_monitor,
                 self.mcp_manager,
+                self.max_tool_rounds,
             ),
             daemon=True,
         )
@@ -2451,6 +2489,7 @@ class QuasarDesktopApp(QMainWindow):
         cancel_event: threading.Event,
         office_monitor: agent.CliCollaborationMonitor | None = None,
         mcp_manager: agent.MCPServerManager | None = None,
+        max_tool_rounds: int | None = None,
     ) -> None:
         try:
             try:
@@ -2479,6 +2518,7 @@ class QuasarDesktopApp(QMainWindow):
                     progress_callback=self.signals.request_progress.emit,
                     cancel_event=cancel_event,
                     office_context=office_context,
+                    max_tool_rounds=max_tool_rounds,
                 )
             except InterruptedError:
                 self.signals.request_cancelled.emit()

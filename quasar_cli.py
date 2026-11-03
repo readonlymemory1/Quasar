@@ -92,6 +92,9 @@ COLLABORATION_IDLE_SECONDS = 20
 OFFICE_DOCUMENT_MAX_SIZE = 20_000_000
 OFFICE_REVIEW_MAX_CHARS = 24_000
 DEBUG_MAX_RESULT_CHARS = 2000
+DEFAULT_MAX_TOOL_ROUNDS = 8
+MIN_TOOL_ROUNDS = 1
+MAX_TOOL_ROUNDS = 32
 DEBUG_SENSITIVE_KEY_PATTERN = re.compile(
     r"(?:password|passwd|token|secret|api[_-]?key|authorization|credential|cookie|body|source)",
     re.IGNORECASE,
@@ -162,6 +165,26 @@ def create_client(provider: str, model_override: str | None = None) -> tuple[Ope
     else:
         raise ValueError(f"지원하지 않는 AI_PROVIDER입니다: {provider}. ollama 또는 openai를 사용하세요.")
     return client, model
+
+
+def get_max_tool_rounds(configured_value: int | None = None) -> int:
+    if configured_value is None:
+        raw_value = os.getenv("QUASAR_MAX_TOOL_ROUNDS")
+        if raw_value is None:
+            return DEFAULT_MAX_TOOL_ROUNDS
+        try:
+            configured_value = int(raw_value)
+        except ValueError as error:
+            raise ValueError(
+                "QUASAR_MAX_TOOL_ROUNDS는 1에서 32 사이의 정수여야 합니다."
+            ) from error
+    if (
+        not isinstance(configured_value, int)
+        or isinstance(configured_value, bool)
+        or not MIN_TOOL_ROUNDS <= configured_value <= MAX_TOOL_ROUNDS
+    ):
+        raise ValueError("도구 반복 단계 수는 1에서 32 사이여야 합니다.")
+    return configured_value
 
 
 def choose_provider(default_provider: str) -> str:
@@ -3072,8 +3095,10 @@ def request_agent(
     progress_callback: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
     office_context: str = "",
+    max_tool_rounds: int | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
+    max_tool_rounds = get_max_tool_rounds(max_tool_rounds)
     saved_user_message: dict[str, Any] = {"role": "user", "content": user_input}
     working_user_message = saved_user_message
     current_document = (
@@ -3140,10 +3165,11 @@ def request_agent(
             mcp_manager,
             progress_callback,
             cancel_event,
+            max_tool_rounds,
         )
 
     active_mcp_names: set[str] = set()
-    for _ in range(8):
+    for _ in range(max_tool_rounds):
         _raise_if_cancelled(cancel_event)
         available_tools = [
             tool for tool in TOOLS
@@ -3260,7 +3286,9 @@ def request_agent(
         progress_callback("요청을 분석하고 있습니다...")
     response = client.chat.completions.create(model=model, messages=working_messages)
     _raise_if_cancelled(cancel_event)
-    answer = response.choices[0].message.content or "도구 실행 횟수 제한에 도달했습니다. 요청을 나누어 다시 시도해 주세요."
+    answer = response.choices[0].message.content or (
+        "도구 반복 한도에 도달했습니다. 설정에서 한도를 높인 뒤 다시 시도해 주세요."
+    )
     print_debug_event("도구 반복 한도 후 모델 응답", answer)
     messages.extend([saved_user_message, {"role": "assistant", "content": answer}])
     return answer
@@ -3277,10 +3305,12 @@ def request_agent_with_responses(
     mcp_manager: MCPServerManager | None = None,
     progress_callback: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    max_tool_rounds: int | None = None,
 ) -> str:
+    max_tool_rounds = get_max_tool_rounds(max_tool_rounds)
     response_input = to_responses_input(working_messages)
     active_mcp_names: set[str] = set()
-    for _ in range(8):
+    for _ in range(max_tool_rounds):
         _raise_if_cancelled(cancel_event)
         available_tools = [
             tool for tool in TOOLS
@@ -3410,7 +3440,9 @@ def request_agent_with_responses(
         progress_callback("요청을 분석하고 있습니다...")
     response = client.responses.create(model=model, input=response_input)
     _raise_if_cancelled(cancel_event)
-    answer = response.output_text or "도구 실행 횟수 제한에 도달했습니다. 요청을 나누어 다시 시도해 주세요."
+    answer = response.output_text or (
+        "도구 반복 한도에 도달했습니다. 설정에서 한도를 높인 뒤 다시 시도해 주세요."
+    )
     print_debug_event("도구 반복 한도 후 모델 응답", answer)
     messages.extend([saved_user_message, {"role": "assistant", "content": answer}])
     return answer
