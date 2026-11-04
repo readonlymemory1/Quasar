@@ -26,12 +26,30 @@ from urllib.request import Request, urlopen
 import quasar_cli as agent
 from chat_history import ChatHistoryStore
 from PySide6.QtCore import QObject, QPointF, QSettings, QStandardPaths, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QKeyEvent, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtGui import (
+    QColor,
+    QIcon,
+    QImage,
+    QKeyEvent,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from quasar_galaxy import (
     CANVAS_BACKGROUND_STOPS,
     BlackHoleOverlay,
     GalaxyTransitionOverlay,
     OrbWidget,
+)
+from quasar_desktop_control import (
+    MAX_ACTIONS_PER_SESSION,
+    MAX_SESSION_SECONDS,
+    DEFAULT_SESSION_SECONDS,
+    MIN_SESSION_SECONDS,
+    DesktopControlSession,
+    capture_desktop_image,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -87,6 +105,11 @@ SYSTEM_PROMPT = (
     "Use the provided tools when needed, but do not make system changes or perform external actions that were not requested. "
     "Run requested low-risk commands without a confirmation dialog. Always obtain explicit user approval "
     "before destructive commands such as deleting files or changing system settings. "
+    "When using desktop controls, only act during the user-started, time-limited desktop session. "
+    "For desktop mouse tools, provide normalized x and y values from 0 to 1000 over the "
+    "original screenshot, not pixel coordinates or coordinates from a resized preview. "
+    "Never enter passwords or secrets, bypass security prompts, or perform irreversible submission, "
+    "deletion, purchase, or account/security changes without explicit confirmation. "
     "Send email only when explicitly requested, and clarify ambiguous requests first. "
     "For browser tasks, navigate to the requested page once, then continue interacting with the current page. "
     "Do not navigate to or reload the same URL again unless the user explicitly asks to refresh or revisit it. "
@@ -267,6 +290,7 @@ class MicrophoneSettingsDialog(QDialog):
         selected_device_index: int | None,
         max_tool_rounds: int,
         tool_calling_mode: str,
+        desktop_control_seconds: int,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -297,6 +321,17 @@ class MicrophoneSettingsDialog(QDialog):
             "동적 방식은 먼저 도구 카테고리를 선택하고 필요한 도구만 요청별로 제공합니다."
         )
         form.addRow("도구 호출 방식", self.tool_calling_mode_selector)
+        self.desktop_control_seconds_selector = QSpinBox()
+        self.desktop_control_seconds_selector.setRange(
+            MIN_SESSION_SECONDS,
+            MAX_SESSION_SECONDS,
+        )
+        self.desktop_control_seconds_selector.setValue(desktop_control_seconds)
+        self.desktop_control_seconds_selector.setSuffix("초")
+        self.desktop_control_seconds_selector.setToolTip(
+            "사용자가 직접 시작한 화면 제어 세션의 최대 시간 (10~300초)"
+        )
+        form.addRow("화면 제어 시간", self.desktop_control_seconds_selector)
         layout.addLayout(form)
 
         self.microphone_status = QLabel()
@@ -376,6 +411,10 @@ class MicrophoneSettingsDialog(QDialog):
     @property
     def tool_calling_mode(self) -> str:
         return str(self.tool_calling_mode_selector.currentData())
+
+    @property
+    def desktop_control_seconds(self) -> int:
+        return self.desktop_control_seconds_selector.value()
 
     def _toggle_audio_test_recording(self) -> None:
         if self.audio_test_worker is not None and self.audio_test_worker.is_alive():
@@ -1401,6 +1440,160 @@ class MessageInput(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class DesktopControlDialog(QDialog):
+    def __init__(
+        self,
+        control_session: DesktopControlSession,
+        parent: QWidget,
+    ) -> None:
+        super().__init__(parent)
+        self.control_session = control_session
+        self.setWindowTitle("Quasar 데스크톱 제어")
+        self.setMinimumSize(720, 520)
+        self.setModal(False)
+
+        layout = QVBoxLayout(self)
+        self.notice = QLabel()
+        self.notice.setWordWrap(True)
+        layout.addWidget(self.notice)
+
+        self.preview = QLabel("화면을 불러오는 중...")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumSize(640, 360)
+        self.preview.setStyleSheet("background: #090d1c; border: 1px solid #303957;")
+        layout.addWidget(self.preview, 1)
+
+        self.status = QLabel("미리보기 전용 · 데스크톱 제어는 꺼져 있습니다.")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        self.start_button = QPushButton()
+        self.stop_button = QPushButton("제어 중지")
+        self.stop_button.setEnabled(False)
+        close_button = QPushButton("닫기")
+        buttons.addWidget(self.start_button)
+        buttons.addWidget(self.stop_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        self.start_button.clicked.connect(self._start_session)
+        self.stop_button.clicked.connect(self._stop_session)
+        close_button.clicked.connect(self.close)
+
+        self._capture_exclusion_error: str | None = None
+        self.update_session_duration()
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(250)
+        self.preview_timer.timeout.connect(self._refresh_preview)
+        self.preview_timer.start()
+        self._refresh_preview()
+
+    def update_session_duration(self) -> None:
+        duration = self.control_session.duration_seconds
+        self.notice.setText(
+            "미리보기는 이 PC에서 초당 약 4회 갱신됩니다. 제어 세션을 시작하면 "
+            f"최대 {duration}초 동안 최대 {MAX_ACTIONS_PER_SESSION}회 "
+            "마우스·키 입력을 허용합니다. 화면은 에이전트가 캡처 도구를 호출할 때만 "
+            "선택한 AI 제공자로 전송됩니다. 화면을 이해하려면 비전 입력을 지원하는 모델이 "
+            "필요합니다. 암호나 비밀정보가 보이는 화면은 제어하지 마세요."
+        )
+        self.start_button.setText(f"제어 시작 (최대 {duration}초)")
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        if self._capture_exclusion_error is not None:
+            return
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            set_affinity = user32.SetWindowDisplayAffinity
+            set_affinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            set_affinity.restype = ctypes.c_bool
+            if not set_affinity(int(self.winId()), 0x00000011):
+                error_code = ctypes.get_last_error()
+                raise OSError(error_code, ctypes.FormatError(error_code))
+        except (AttributeError, OSError) as error:
+            self._capture_exclusion_error = str(error)
+            self.status.setText(
+                "알림: 화면 캡처에서 미리보기 창을 숨기지 못했습니다. "
+                f"제어 시 화면에 미리보기 창이 포함될 수 있습니다 ({error})."
+            )
+
+    def _start_session(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "데스크톱 제어 활성화",
+            "활성 세션 동안 에이전트가 화면을 관찰하고 마우스·키 입력을 수행할 수 있습니다. "
+            f"세션은 최대 {self.control_session.duration_seconds}초 또는 "
+            f"{MAX_ACTIONS_PER_SESSION}회 입력 후 자동으로 끝납니다. 시작할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.control_session.start()
+        except RuntimeError as error:
+            QMessageBox.warning(self, "데스크톱 제어를 시작할 수 없음", str(error))
+            return
+        self.status.setText(
+            f"제어 활성 · 남은 시간 {self.control_session.remaining_seconds()}초 · "
+            "중지 버튼으로 즉시 종료할 수 있습니다."
+        )
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+    def _stop_session(self) -> None:
+        self.control_session.stop()
+        self.status.setText("미리보기 전용 · 데스크톱 제어가 중지되었습니다.")
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
+    def _refresh_preview(self) -> None:
+        try:
+            image = capture_desktop_image()
+            image_data = image.tobytes("raw", "RGB")
+            frame = QImage(
+                image_data,
+                image.width,
+                image.height,
+                image.width * 3,
+                QImage.Format.Format_RGB888,
+            ).copy()
+            self.preview.setPixmap(
+                QPixmap.fromImage(frame).scaled(
+                    self.preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        except (OSError, RuntimeError) as error:
+            self.preview.setText(f"화면 캡처 실패: {error}")
+            self.preview.setPixmap(QPixmap())
+
+        remaining = self.control_session.remaining_seconds()
+        if remaining == 0 and self.stop_button.isEnabled():
+            self.status.setText("세션이 만료되었습니다. 미리보기만 계속합니다.")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+        elif remaining > 0:
+            self.status.setText(
+                f"제어 활성 · 남은 시간 {remaining}초 · "
+                "중지 버튼으로 즉시 종료할 수 있습니다."
+            )
+        elif self._capture_exclusion_error is not None:
+            self.status.setText(
+                "미리보기 전용 · 데스크톱 제어는 꺼져 있습니다. "
+                "캡처 시 미리보기 창이 포함될 수 있습니다."
+            )
+
+    def closeEvent(self, event: Any) -> None:
+        self.preview_timer.stop()
+        self.control_session.stop()
+        super().closeEvent(event)
+
+
 class QuasarDesktopApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1621,6 +1814,109 @@ class QuasarDesktopApp(QMainWindow):
         self.alarm_notifications: list[QMessageBox] = []
         self._create_client(self.provider)
         self.original_run_tool = agent.run_tool
+        self.desktop_control_settings_error: str | None = None
+        self.desktop_control_seconds = self.settings.value(
+            "desktop/control_session_seconds",
+            DEFAULT_SESSION_SECONDS,
+            type=int,
+        )
+        try:
+            self.desktop_control_session = DesktopControlSession(
+                self.desktop_control_seconds
+            )
+        except ValueError as error:
+            self.desktop_control_seconds = DEFAULT_SESSION_SECONDS
+            self.desktop_control_session = DesktopControlSession()
+            self.desktop_control_settings_error = str(error)
+        self.desktop_tool_schemas = [
+            agent.tool_schema(
+                "desktop_capture",
+                "Capture the current Windows virtual desktop as an image for visual analysis. "
+                "Only works while the user-started desktop control session is active. "
+                "Subsequent mouse tools use x and y normalized independently from 0 to 1000 "
+                "across the original image, regardless of image resizing.",
+                {},
+                [],
+            ),
+            agent.tool_schema(
+                "desktop_move_mouse",
+                "Move the mouse to normalized coordinates in the latest desktop_capture image. "
+                "x and y each range from 0 to 1000 across the original image; use this scale "
+                "even if the image is resized for vision. Only works during the active session.",
+                {
+                    "x": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000,
+                        "description": "Horizontal position from 0 (left) to 1000 (right).",
+                    },
+                    "y": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000,
+                        "description": "Vertical position from 0 (top) to 1000 (bottom).",
+                    },
+                },
+                ["x", "y"],
+            ),
+            agent.tool_schema(
+                "desktop_click",
+                "Move to normalized coordinates in the latest desktop_capture image and perform "
+                "one left click. x and y each range from 0 to 1000 across the original image; "
+                "use this scale even if the image is resized for vision. "
+                "Do not use for irreversible actions without explicit user confirmation.",
+                {
+                    "x": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000,
+                        "description": "Horizontal position from 0 (left) to 1000 (right).",
+                    },
+                    "y": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000,
+                        "description": "Vertical position from 0 (top) to 1000 (bottom).",
+                    },
+                },
+                ["x", "y"],
+            ),
+            agent.tool_schema(
+                "desktop_type_text",
+                "Type literal text into the currently focused desktop field. "
+                "Never enter passwords, secrets, or text the user has not authorized.",
+                {"text": {"type": "string"}},
+                ["text"],
+            ),
+            agent.tool_schema(
+                "desktop_press_key",
+                "Press one allowed desktop key: ENTER, TAB, ESCAPE, BACKSPACE, DELETE, "
+                "SPACE, arrows, HOME, END, PAGEUP, or PAGEDOWN. No key combinations are supported.",
+                {
+                    "key": {
+                        "type": "string",
+                        "enum": [
+                            "BACKSPACE",
+                            "DELETE",
+                            "DOWN",
+                            "END",
+                            "ENTER",
+                            "ESCAPE",
+                            "HOME",
+                            "LEFT",
+                            "PAGEDOWN",
+                            "PAGEUP",
+                            "RIGHT",
+                            "SPACE",
+                            "TAB",
+                            "UP",
+                        ],
+                    }
+                },
+                ["key"],
+            ),
+        ]
+        agent.TOOLS.extend(self.desktop_tool_schemas)
         self.tts_tool_schema = agent.tool_schema(
             "set_tts_enabled",
             "Turn Quasar's spoken responses on or off. Use when the user asks to enable or disable TTS.",
@@ -1669,6 +1965,11 @@ class QuasarDesktopApp(QMainWindow):
         )
         self.menu_button.clicked.connect(self._toggle_radial_menu)
 
+        self.new_chat_button = QPushButton("새 채팅")
+        self.new_chat_button.setFixedHeight(40)
+        self.new_chat_button.setToolTip("새 채팅 시작")
+        self.new_chat_button.clicked.connect(self._start_new_chat)
+
         self.provider_selector = QComboBox()
         self.provider_selector.addItems(("ollama", "openai", "nvidia_nim"))
         self.provider_selector.setCurrentText(self.provider)
@@ -1691,6 +1992,7 @@ class QuasarDesktopApp(QMainWindow):
         self.model_selector.setToolTip("모델 선택 또는 모델 이름 직접 입력")
         self.model_selector.currentTextChanged.connect(self._remember_model)
         header.addWidget(self.model_selector, 1)
+        header.addWidget(self.new_chat_button)
         header.addWidget(self.menu_button)
 
         self.refresh_models_button = QPushButton("모델 새로고침")
@@ -1907,8 +2209,8 @@ class QuasarDesktopApp(QMainWindow):
         self.radial_buttons: list[QToolButton] = []
         radial_actions = (
             ("새 채팅", self._start_new_chat),
-            ("최근 채팅", self._open_recent_chats),
-            ("기록 삭제", self._clear_chat_history),
+            ("채팅 목록", self._open_recent_chats),
+            ("화면 제어", self._open_desktop_control),
             ("임시 채팅", self._toggle_temporary_chat),
             ("모델 갱신", self._load_model_options),
             ("설정", self._open_settings),
@@ -2215,6 +2517,7 @@ class QuasarDesktopApp(QMainWindow):
             self.microphone_device_index,
             self.max_tool_rounds,
             self.tool_calling_mode,
+            self.desktop_control_seconds,
             self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -2271,6 +2574,10 @@ class QuasarDesktopApp(QMainWindow):
             "agent/tool_calling_mode",
             dialog.tool_calling_mode,
         )
+        self.settings.setValue(
+            "desktop/control_session_seconds",
+            dialog.desktop_control_seconds,
+        )
         if selected_device is None:
             self.settings.remove("audio/input_device_name")
             self.settings.remove("audio/input_device_host_api")
@@ -2299,8 +2606,16 @@ class QuasarDesktopApp(QMainWindow):
         self.microphone_device_index = selected_device_index
         self.max_tool_rounds = dialog.max_tool_rounds
         self.tool_calling_mode = dialog.tool_calling_mode
+        self.desktop_control_seconds = dialog.desktop_control_seconds
+        self.desktop_control_session.set_duration_seconds(
+            self.desktop_control_seconds
+        )
+        existing_desktop_dialog = getattr(self, "desktop_control_dialog", None)
+        if existing_desktop_dialog is not None:
+            existing_desktop_dialog.update_session_duration()
         self.tool_rounds_error = None
         self.tool_calling_mode_error = None
+        self.desktop_control_settings_error = None
         self.microphone_notice = None
         self.status_label.setText(
             f"입력 마이크: {dialog.selected_device_name}"
@@ -2374,6 +2689,13 @@ class QuasarDesktopApp(QMainWindow):
             status = f"{status} · {status_message}" if status else status_message
         if self.tool_calling_mode_error:
             status_message = f"도구 호출 방식 설정 오류: {self.tool_calling_mode_error}"
+            status = f"{status} · {status_message}" if status else status_message
+        if self.desktop_control_settings_error:
+            status_message = (
+                "화면 제어 시간 설정 오류: "
+                f"{self.desktop_control_settings_error} "
+                f"(기본값 {DEFAULT_SESSION_SECONDS}초 사용)"
+            )
             status = f"{status} · {status_message}" if status else status_message
         if self.chat_history_error:
             status_message = f"채팅 기록 저장 오류: {self.chat_history_error}"
@@ -2742,53 +3064,6 @@ class QuasarDesktopApp(QMainWindow):
             self.chat_history_error = str(error)
             self.status_label.setText(f"채팅 기록 저장 오류: {error}")
 
-    def _clear_chat_history(self) -> None:
-        if self.busy:
-            QMessageBox.information(
-                self,
-                "기록 삭제",
-                "응답이 끝난 뒤 채팅 기록을 삭제해 주세요.",
-            )
-            return
-        if self.chat_history_store is None:
-            QMessageBox.warning(
-                self,
-                "기록 삭제",
-                f"채팅 기록 저장소를 사용할 수 없습니다: "
-                f"{self.chat_history_error or '알 수 없는 오류'}",
-            )
-            return
-        answer = QMessageBox.question(
-            self,
-            "채팅 기록 삭제",
-            "저장된 모든 채팅 기록을 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            deleted_count = self.chat_history_store.delete_all()
-        except (OSError, sqlite3.Error, ValueError) as error:
-            self.chat_history_error = str(error)
-            QMessageBox.warning(
-                self,
-                "기록 삭제 실패",
-                f"채팅 기록을 삭제하지 못했습니다: {error}",
-            )
-            return
-
-        self.chat_history_error = None
-        self.current_chat_id = None
-        self.suspended_chat = None
-        if not self.temporary_chat:
-            self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            self._clear_chat_view()
-        self.status_label.setText(
-            f"저장된 채팅 기록 {deleted_count}개를 삭제했습니다."
-        )
-
     def _update_chat_mode_ui(self) -> None:
         self.control_core_title.setText(
             "임시 채팅" if self.temporary_chat else "QUASAR"
@@ -2936,6 +3211,7 @@ class QuasarDesktopApp(QMainWindow):
                 f"{self.chat_history_error or '알 수 없는 오류'}",
             )
             return
+        history_store = self.chat_history_store
         if self.temporary_chat:
             answer = QMessageBox.question(
                 self,
@@ -2948,40 +3224,143 @@ class QuasarDesktopApp(QMainWindow):
                 return
             self._toggle_temporary_chat()
 
-        try:
-            conversations = self.chat_history_store.list_recent()
-        except (OSError, sqlite3.Error, ValueError) as error:
-            self.chat_history_error = str(error)
-            QMessageBox.warning(
-                self,
-                "최근 채팅",
-                f"최근 채팅을 불러오지 못했습니다: {error}",
-            )
-            return
-
         dialog = QDialog(self)
-        dialog.setWindowTitle("최근 채팅")
+        dialog.setWindowTitle("채팅 목록")
         layout = QVBoxLayout(dialog)
+        count_label = QLabel()
         chat_list = QListWidget()
-        for conversation in conversations:
-            updated_at = conversation["updated_at"][:16].replace("T", " ")
-            item = QListWidgetItem(
-                f"{conversation['title']}\n{updated_at}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, conversation["id"])
-            chat_list.addItem(item)
+        chat_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         layout.addWidget(chat_list)
+        layout.insertWidget(0, count_label)
         buttons = QHBoxLayout()
         open_button = QPushButton("열기")
-        open_button.setEnabled(bool(conversations))
+        delete_button = QPushButton("선택 삭제")
+        delete_all_button = QPushButton("전체 삭제")
         close_button = QPushButton("닫기")
-        buttons.addStretch(1)
+        open_button.setEnabled(False)
+        delete_button.setEnabled(False)
+        delete_all_button.setEnabled(False)
         buttons.addWidget(open_button)
+        buttons.addWidget(delete_button)
+        buttons.addWidget(delete_all_button)
+        buttons.addStretch(1)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
-        open_button.clicked.connect(dialog.accept)
         close_button.clicked.connect(dialog.reject)
-        chat_list.itemDoubleClicked.connect(dialog.accept)
+        chat_list.itemDoubleClicked.connect(lambda _item: dialog.accept())
+
+        def refresh_chat_list() -> None:
+            try:
+                conversations = history_store.list_recent()
+            except (OSError, sqlite3.Error, ValueError) as error:
+                self.chat_history_error = str(error)
+                chat_list.clear()
+                count_label.setText("채팅 목록을 불러오지 못했습니다.")
+                open_button.setEnabled(False)
+                delete_button.setEnabled(False)
+                delete_all_button.setEnabled(False)
+                QMessageBox.warning(
+                    dialog,
+                    "채팅 목록",
+                    f"채팅 목록을 불러오지 못했습니다: {error}",
+                )
+                return
+            chat_list.clear()
+            for conversation in conversations:
+                updated_at = conversation["updated_at"][:16].replace("T", " ")
+                item = QListWidgetItem(
+                    f"{conversation['title']}\n{updated_at}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, conversation["id"])
+                chat_list.addItem(item)
+            count_label.setText(
+                f"저장된 채팅 {len(conversations)}개"
+                if conversations
+                else "저장된 채팅이 없습니다."
+            )
+            open_button.setEnabled(bool(conversations))
+            delete_button.setEnabled(bool(conversations))
+            delete_all_button.setEnabled(bool(conversations))
+
+        def clear_current_chat(chat_id: str | None = None) -> None:
+            if chat_id is not None and self.current_chat_id != chat_id:
+                if (
+                    self.suspended_chat is not None
+                    and self.suspended_chat[0] == chat_id
+                ):
+                    self.suspended_chat = None
+                return
+            self.current_chat_id = None
+            self.suspended_chat = None
+            if not self.temporary_chat:
+                self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                self._clear_chat_view()
+
+        def delete_selected_chat() -> None:
+            selected_item = chat_list.currentItem()
+            if selected_item is None:
+                return
+            chat_id = selected_item.data(Qt.ItemDataRole.UserRole)
+            answer = QMessageBox.question(
+                dialog,
+                "채팅 삭제",
+                "선택한 채팅을 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                deleted = history_store.delete(chat_id)
+            except (OSError, sqlite3.Error, ValueError) as error:
+                self.chat_history_error = str(error)
+                QMessageBox.warning(
+                    dialog,
+                    "채팅 삭제 실패",
+                    f"선택한 채팅을 삭제하지 못했습니다: {error}",
+                )
+                return
+            if deleted:
+                self.chat_history_error = None
+                clear_current_chat(chat_id)
+                self.status_label.setText("선택한 채팅을 삭제했습니다.")
+                refresh_chat_list()
+
+        def delete_all_chats() -> None:
+            answer = QMessageBox.question(
+                dialog,
+                "전체 채팅 삭제",
+                "저장된 모든 채팅을 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                deleted_count = history_store.delete_all()
+            except (OSError, sqlite3.Error, ValueError) as error:
+                self.chat_history_error = str(error)
+                QMessageBox.warning(
+                    dialog,
+                    "채팅 삭제 실패",
+                    f"채팅 목록을 삭제하지 못했습니다: {error}",
+                )
+                return
+            self.chat_history_error = None
+            clear_current_chat()
+            self.status_label.setText(
+                f"저장된 채팅 {deleted_count}개를 삭제했습니다."
+            )
+            refresh_chat_list()
+
+        def open_selected_chat() -> None:
+            if chat_list.currentItem() is not None:
+                dialog.accept()
+
+        open_button.clicked.connect(open_selected_chat)
+        delete_button.clicked.connect(delete_selected_chat)
+        delete_all_button.clicked.connect(delete_all_chats)
+        refresh_chat_list()
         dialog.resize(440, 520)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3086,6 +3465,20 @@ class QuasarDesktopApp(QMainWindow):
             return False
         return bool(request["approved"])
 
+    def _open_desktop_control(self) -> None:
+        existing_dialog = getattr(self, "desktop_control_dialog", None)
+        if existing_dialog is not None and existing_dialog.isVisible():
+            existing_dialog.raise_()
+            existing_dialog.activateWindow()
+            return
+        dialog = DesktopControlDialog(self.desktop_control_session, self)
+        self.desktop_control_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.destroyed.connect(
+            lambda: setattr(self, "desktop_control_dialog", None)
+        )
+        dialog.show()
+
     def _show_tool_approval(
         self,
         name: str,
@@ -3125,6 +3518,31 @@ class QuasarDesktopApp(QMainWindow):
             message, kind = agent.validate_user_message(arguments)
             self.signals.agent_message.emit(message, kind)
             return "메시지를 사용자 채팅에 표시했습니다."
+        if name.startswith("desktop_"):
+            try:
+                if name == "desktop_capture":
+                    return self.desktop_control_session.capture_for_agent()
+                if name == "desktop_move_mouse":
+                    return self.desktop_control_session.move_mouse(
+                        arguments.get("x"),
+                        arguments.get("y"),
+                    )
+                if name == "desktop_click":
+                    return self.desktop_control_session.click(
+                        arguments.get("x"),
+                        arguments.get("y"),
+                    )
+                if name == "desktop_type_text":
+                    return self.desktop_control_session.type_text(
+                        arguments.get("text")
+                    )
+                if name == "desktop_press_key":
+                    return self.desktop_control_session.press_key(
+                        arguments.get("key")
+                    )
+            except (OSError, RuntimeError, ValueError) as error:
+                return f"데스크톱 제어 실패: {type(error).__name__}: {error}"
+            return f"알 수 없는 데스크톱 제어 도구: {name}"
         if name == "execute_cmd":
             return self.original_run_tool(
                 name,
@@ -3895,6 +4313,10 @@ class QuasarDesktopApp(QMainWindow):
         if self.speech_worker is not None:
             self.speech_worker.stop()
         self.voice_recognizer.close()
+        self.desktop_control_session.stop()
+        for schema in self.desktop_tool_schemas:
+            if schema in agent.TOOLS:
+                agent.TOOLS.remove(schema)
         if self.mcp_manager is not None:
             mcp_manager = self.mcp_manager
             self.mcp_manager = None

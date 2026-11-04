@@ -56,7 +56,7 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     "web": (
         "웹",
         "공개 웹 검색, Chrome에서 페이지 열기·탭 전환·탐색, 페이지 클릭·입력·스크롤·키 입력, "
-        "화면 캡처. 페이지 조작 전 DOM을 확인하고 결과를 검증하세요.",
+        "화면 캡처, 브라우저 제어 MCP 도구. 페이지 조작 전 DOM을 확인하고 결과를 검증하세요.",
         frozenset({
             "web_search",
             "web_navigate",
@@ -69,6 +69,22 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
             "web_back",
             "web_key_press",
             "capture_screen",
+        }),
+    ),
+    "desktop": (
+        "데스크톱 제어",
+        "사용자가 Quasar 설정에서 정한 10~300초 시간과 Quasar 데스크톱 제어 창에서 "
+        "명시적으로 시작한 세션 안에서만 "
+        "화면 캡처, 좌표 마우스 이동·왼쪽 클릭, 문자 입력, 제한된 키 입력을 수행합니다. "
+        "세션은 40회 동작으로 제한되며 화면 미리보기에서 언제든 중지할 수 있습니다. "
+        "화면 캡처는 사용자가 요청했을 때 모델에 전송됩니다. 비밀번호 입력이나 "
+        "사용자 확인이 필요한 최종 제출·삭제·구매 등은 수행하지 마세요.",
+        frozenset({
+            "desktop_capture",
+            "desktop_move_mouse",
+            "desktop_click",
+            "desktop_type_text",
+            "desktop_press_key",
         }),
     ),
     "email": (
@@ -122,7 +138,8 @@ _CATEGORY_PURPOSES = {
     "code": "코드를 작성할 때 사용하는 도구입니다.",
     "code_analysis": "코드를 빠르게 탐색하고 구조와 변경 사항을 분석하는 도구입니다.",
     "files": "작업 폴더의 파일과 문서를 다루는 도구입니다.",
-    "web": "웹을 탐색할 수 있는 도구입니다.",
+    "web": "웹과 연결된 브라우저 제어 MCP를 다루는 도구입니다.",
+    "desktop": "활성화된 제한 시간 동안 데스크톱 화면을 보고 기본 입력을 수행합니다.",
     "email": "이메일을 검색하고 작성하는 도구입니다.",
     "calendar": "일정과 시간 관련 작업에 사용하는 도구입니다.",
     "tasks": "할 일 목록을 관리하는 도구입니다.",

@@ -2835,6 +2835,7 @@ class MCPServerManager:
         self._lock = threading.RLock()
         self.connections: dict[str, MCPStdioConnection] = {}
         self.tools: dict[str, tuple[MCPStdioConnection, str, dict[str, Any]]] = {}
+        self.browser_control_servers: set[str] = set()
         self.pending_servers: dict[str, dict[str, Any]] = {}
         self.connection_errors: dict[str, str] = {}
         self._config: dict[str, Any] = {"mcpServers": {}}
@@ -2871,6 +2872,44 @@ class MCPServerManager:
             for part in [command, *args]
         )
 
+    @staticmethod
+    def _is_browser_control_server(
+        server_name: str,
+        server_config: dict[str, Any],
+        server_tools: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        browser_identifier = re.compile(
+            r"(?<![a-z0-9])(chrome|chromium|browser|playwright|puppeteer|selenium)(?![a-z0-9])",
+            re.IGNORECASE,
+        )
+        command = server_config.get("command", "")
+        args = server_config.get("args", [])
+        command_parts = [command, *(args if isinstance(args, list) else [])]
+        if browser_identifier.search(server_name) or any(
+            isinstance(part, str) and browser_identifier.search(part)
+            for part in command_parts
+        ):
+            return True
+
+        distinctive_browser_tools = {
+            "close_page",
+            "evaluate_script",
+            "get_css_styles",
+            "list_pages",
+            "navigate_page",
+            "performance_start_trace",
+            "screencast_start",
+            "select_page",
+            "take_heapsnapshot",
+            "take_snapshot",
+        }
+        tool_names = {
+            tool.get("name")
+            for tool in server_tools or []
+            if isinstance(tool.get("name"), str)
+        }
+        return len(tool_names & distinctive_browser_tools) >= 2
+
     def _connect_server(self, server_name: str, server_config: dict[str, Any]) -> None:
         with self._lock:
             if server_name in self.connections:
@@ -2889,6 +2928,12 @@ class MCPServerManager:
 
             self.connections[server_name] = connection
             self.connection_errors.pop(server_name, None)
+            if self._is_browser_control_server(
+                server_name,
+                server_config,
+                server_tools,
+            ):
+                self.browser_control_servers.add(server_name)
             used_names = {tool["function"]["name"] for tool in TOOLS}
             used_names.update(self.tools)
             for tool in server_tools:
@@ -3028,6 +3073,7 @@ class MCPServerManager:
             return result
 
     def _disconnect_server(self, server_name: str) -> None:
+        self.browser_control_servers.discard(server_name)
         connection = self.connections.pop(server_name, None)
         if connection is None:
             return
@@ -3074,6 +3120,42 @@ class MCPServerManager:
                 })
             return schemas
 
+    def web_control_tool_schemas(self) -> list[dict[str, Any]]:
+        with self._lock:
+            for server_name, server_config in list(self.pending_servers.items()):
+                if not self._is_browser_control_server(server_name, server_config):
+                    continue
+                try:
+                    self._connect_server(server_name, server_config)
+                except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+                    self.connection_errors[server_name] = str(error)
+                    print(
+                        f"[MCP 연결 실패] {server_name}: {error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    del self.pending_servers[server_name]
+
+            browser_schemas = []
+            for schema in self.tool_schemas():
+                exposed_name = schema["function"]["name"]
+                entry = self.tools.get(exposed_name)
+                if entry is not None and entry[0].name in self.browser_control_servers:
+                    browser_schemas.append(schema)
+            return browser_schemas
+
+    def browser_control_connection_errors(self) -> dict[str, str]:
+        with self._lock:
+            servers = self._config.get("mcpServers", {})
+            if not isinstance(servers, dict):
+                return {}
+            return {
+                name: error
+                for name, error in self.connection_errors.items()
+                if isinstance(servers.get(name), dict)
+                and self._is_browser_control_server(name, servers[name])
+            }
+
     def find_tool_schemas(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
         with self._lock:
             if self.pending_servers and re.search(
@@ -3099,7 +3181,9 @@ class MCPServerManager:
                 return []
 
             ranked_tools = []
-            for exposed_name, (_, tool_name, server_tool) in self.tools.items():
+            for exposed_name, (connection, tool_name, server_tool) in self.tools.items():
+                if connection.name in self.browser_control_servers:
+                    continue
                 description = server_tool.get("description")
                 name_terms = set(re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", f"{exposed_name} {tool_name}".lower()))
                 description_terms = set(re.findall(r"[a-z0-9]+|[\uac00-\ud7a3]+", (description or "").lower()))
@@ -3308,6 +3392,11 @@ def _available_tool_schemas(
         )
 
     if mcp_manager is not None:
+        if (
+            mode == quasar_tool_calling.DYNAMIC_MODE
+            and "web" in loaded_categories
+        ):
+            available.extend(mcp_manager.web_control_tool_schemas())
         available.extend(
             schema
             for schema in mcp_manager.tool_schemas()
@@ -3323,6 +3412,40 @@ def _available_tool_schemas(
             continue
         unique_tools[tool["function"]["name"]] = tool
     return list(unique_tools.values())
+
+
+def _load_tool_categories(
+    requested_categories: Any,
+    loaded_categories: set[str],
+    mcp_manager: MCPServerManager | None,
+) -> str:
+    result = quasar_tool_calling.load_categories(
+        requested_categories,
+        loaded_categories,
+        TOOLS,
+    )
+    if (
+        result.startswith("도구 카테고리 선택 실패:")
+        or not isinstance(requested_categories, list)
+        or "web" not in requested_categories
+        or mcp_manager is None
+    ):
+        return result
+
+    browser_tools = mcp_manager.web_control_tool_schemas()
+    browser_names = sorted(
+        schema["function"]["name"] for schema in browser_tools
+    )
+    if browser_names:
+        result += "\n웹 제어 MCP 도구: " + ", ".join(browser_names)
+    else:
+        result += "\n웹 제어 MCP 도구: 현재 연결된 브라우저 MCP가 없습니다."
+    errors = mcp_manager.browser_control_connection_errors()
+    if errors:
+        result += "\n브라우저 MCP 연결 실패: " + "; ".join(
+            f"{name}: {error}" for name, error in sorted(errors.items())
+        )
+    return result
 
 
 def validate_user_message(arguments: dict[str, Any]) -> tuple[str, str]:
@@ -3911,8 +4034,21 @@ def request_agent(
             print_debug_event("모델이 출력한 안내", response_message.content)
         working_messages.append(response_message.model_dump(exclude_none=True))
         screenshot_result = None
+        screenshot_tool_name = None
         for tool_call in response_message.tool_calls:
             _raise_if_cancelled(cancel_event)
+            if screenshot_tool_name == "desktop_capture":
+                result = (
+                    "Desktop action skipped: inspect the captured frame in the next "
+                    "model response before issuing another desktop action."
+                )
+                working_messages.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": tool_call.function.name,
+                    "content": result,
+                })
+                continue
             print_tool_status(tool_call.function.name, mcp_manager)
             tool_label = _tool_status_label(tool_call.function.name, mcp_manager)
             if progress_callback is not None:
@@ -3939,10 +4075,10 @@ def request_agent(
                         progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
                 if tool_call.function.name == "select_tool_categories":
-                    result = quasar_tool_calling.load_categories(
+                    result = _load_tool_categories(
                         arguments.get("categories"),
                         loaded_categories,
-                        TOOLS,
+                        mcp_manager,
                     )
                 elif tool_call.function.name == "discover_mcp_tools":
                     if mcp_manager is None:
@@ -3979,8 +4115,12 @@ def request_agent(
                     )
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
                 result = f"도구 인자 해석 오류: {error}"
-            if tool_call.function.name == "capture_screen" and isinstance(result, tuple):
+            if (
+                tool_call.function.name in {"capture_screen", "desktop_capture"}
+                and isinstance(result, tuple)
+            ):
                 screenshot_result = result
+                screenshot_tool_name = tool_call.function.name
                 image_data, width, height = result
                 result = f"현재 화면을 {width} x {height} 픽셀로 캡처했습니다."
             _debug_tool_result(tool_call.function.name, result)
@@ -3996,10 +4136,18 @@ def request_agent(
 
         if screenshot_result and not screen_request:
             image_data, width, height = screenshot_result
+            image_context = (
+                f"방금 캡처한 데스크톱 화면({width} x {height} 픽셀)입니다. "
+                "마우스 도구는 픽셀 좌표 대신 x와 y를 각각 0~1000으로 정규화해 사용합니다. "
+                "(0, 0)은 왼쪽 위, (1000, 1000)은 오른쪽 아래입니다. "
+                "비전 모델이 이미지를 축소해 보더라도 이 정규화 좌표계를 유지하세요."
+                if screenshot_tool_name == "desktop_capture"
+                else f"방금 캡처한 화면({width} x {height} 픽셀)을 분석해 사용자 요청에 답변하세요."
+            )
             working_messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"방금 캡처한 화면({width} x {height} 픽셀)을 분석해 사용자 요청에 답변하세요."},
+                    {"type": "text", "text": image_context},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}", "detail": "high"}},
                 ],
             })
@@ -4071,8 +4219,19 @@ def request_agent_with_responses(
             for item in response.output
         )
         screenshot_result = None
+        screenshot_tool_name = None
         for tool_call in function_calls:
             _raise_if_cancelled(cancel_event)
+            if screenshot_tool_name == "desktop_capture":
+                response_input.append({
+                    "type": "function_call_output",
+                    "call_id": tool_call.call_id,
+                    "output": (
+                        "Desktop action skipped: inspect the captured frame in the next "
+                        "model response before issuing another desktop action."
+                    ),
+                })
+                continue
             print_tool_status(tool_call.name, mcp_manager)
             tool_label = _tool_status_label(tool_call.name, mcp_manager)
             if progress_callback is not None:
@@ -4099,10 +4258,10 @@ def request_agent_with_responses(
                         progress_callback("도구 단계가 끝났습니다. 답변을 준비하고 있습니다...")
                     return final_response.strip()
                 if tool_call.name == "select_tool_categories":
-                    result = quasar_tool_calling.load_categories(
+                    result = _load_tool_categories(
                         arguments.get("categories"),
                         loaded_categories,
-                        TOOLS,
+                        mcp_manager,
                     )
                 elif tool_call.name == "discover_mcp_tools":
                     if mcp_manager is None:
@@ -4140,8 +4299,12 @@ def request_agent_with_responses(
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
                 result = f"도구 인자 해석 오류: {error}"
 
-            if tool_call.name == "capture_screen" and isinstance(result, tuple):
+            if (
+                tool_call.name in {"capture_screen", "desktop_capture"}
+                and isinstance(result, tuple)
+            ):
                 screenshot_result = result
+                screenshot_tool_name = tool_call.name
                 image_data, width, height = result
                 result = f"현재 화면을 {width} x {height} 픽셀로 캡처했습니다."
             _debug_tool_result(tool_call.name, result)
@@ -4156,12 +4319,20 @@ def request_agent_with_responses(
 
         if screenshot_result and not screen_request:
             image_data, width, height = screenshot_result
+            image_context = (
+                f"방금 캡처한 데스크톱 화면({width} x {height} 픽셀)입니다. "
+                "마우스 도구는 픽셀 좌표 대신 x와 y를 각각 0~1000으로 정규화해 사용합니다. "
+                "(0, 0)은 왼쪽 위, (1000, 1000)은 오른쪽 아래입니다. "
+                "비전 모델이 이미지를 축소해 보더라도 이 정규화 좌표계를 유지하세요."
+                if screenshot_tool_name == "desktop_capture"
+                else f"방금 캡처한 화면({width} x {height} 픽셀)을 분석해 사용자 요청에 답변하세요."
+            )
             response_input.append({
                 "role": "user",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"방금 캡처한 화면({width} x {height} 픽셀)을 분석해 사용자 요청에 답변하세요.",
+                        "text": image_context,
                     },
                     {
                         "type": "input_image",

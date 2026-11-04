@@ -106,6 +106,15 @@ class ChatHistoryStore:
                 cursor = connection.execute("DELETE FROM chats")
                 return cursor.rowcount
 
+    def delete(self, chat_id: str) -> bool:
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM chats WHERE id = ?",
+                    (chat_id,),
+                )
+                return cursor.rowcount > 0
+
     def get(self, chat_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as connection:
             row = connection.execute(

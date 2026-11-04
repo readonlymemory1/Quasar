@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from chat_history import ChatHistoryStore
 import Quasar
@@ -61,6 +61,19 @@ class ChatHistoryStoreTests(unittest.TestCase):
             self.assertEqual(deleted_count, 2)
             self.assertEqual(store.list_recent(), [])
 
+    def test_delete_removes_only_the_selected_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ChatHistoryStore(Path(temporary_directory) / "chats.sqlite3")
+            first = store.save(None, [{"role": "user", "content": "first"}])
+            second = store.save(None, [{"role": "user", "content": "second"}])
+
+            deleted = store.delete(first)
+
+            self.assertTrue(deleted)
+            self.assertIsNone(store.get(first))
+            self.assertIsNotNone(store.get(second))
+            self.assertFalse(store.delete(first))
+
 
 class TemporaryChatTests(unittest.TestCase):
     def test_temporary_chat_restores_previous_conversation_without_saving_temp(self) -> None:
@@ -91,66 +104,6 @@ class TemporaryChatTests(unittest.TestCase):
         self.assertEqual(app.messages, original_messages)
         app._add_message.assert_called_once_with("user", "saved message")
         app._update_chat_mode_ui.assert_called_with()
-
-
-class ClearChatHistoryTests(unittest.TestCase):
-    def test_clear_history_deletes_saved_records_and_resets_current_chat(self) -> None:
-        store = SimpleNamespace(delete_all=Mock(return_value=3))
-        app = SimpleNamespace(
-            busy=False,
-            chat_history_store=store,
-            chat_history_error=None,
-            current_chat_id="saved-chat",
-            suspended_chat=("older-chat", []),
-            temporary_chat=False,
-            messages=[{"role": "user", "content": "current"}],
-            status_label=Mock(),
-            _clear_chat_view=Mock(),
-        )
-
-        with patch.object(
-            Quasar.QMessageBox,
-            "question",
-            return_value=Quasar.QMessageBox.StandardButton.Yes,
-        ):
-            Quasar.QuasarDesktopApp._clear_chat_history(app)
-
-        store.delete_all.assert_called_once_with()
-        self.assertIsNone(app.current_chat_id)
-        self.assertIsNone(app.suspended_chat)
-        self.assertEqual(
-            app.messages,
-            [{"role": "system", "content": Quasar.SYSTEM_PROMPT}],
-        )
-        app._clear_chat_view.assert_called_once_with()
-        app.status_label.setText.assert_called_once_with(
-            "저장된 채팅 기록 3개를 삭제했습니다."
-        )
-
-    def test_cancel_clear_history_keeps_records_and_current_chat(self) -> None:
-        store = SimpleNamespace(delete_all=Mock())
-        app = SimpleNamespace(
-            busy=False,
-            chat_history_store=store,
-            chat_history_error=None,
-            current_chat_id="saved-chat",
-            suspended_chat=None,
-            temporary_chat=False,
-            messages=[{"role": "user", "content": "current"}],
-            status_label=Mock(),
-            _clear_chat_view=Mock(),
-        )
-
-        with patch.object(
-            Quasar.QMessageBox,
-            "question",
-            return_value=Quasar.QMessageBox.StandardButton.No,
-        ):
-            Quasar.QuasarDesktopApp._clear_chat_history(app)
-
-        store.delete_all.assert_not_called()
-        self.assertEqual(app.current_chat_id, "saved-chat")
-        self.assertEqual(app.messages, [{"role": "user", "content": "current"}])
 
 
 if __name__ == "__main__":

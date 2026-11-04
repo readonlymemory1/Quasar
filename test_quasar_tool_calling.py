@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -334,6 +335,115 @@ class HighRiskCommandApprovalTests(unittest.TestCase):
             result = quasar_cli.execute_cmd("npx tool")
 
         self.assertEqual(result, "실행 실패 (코드 7):\ncommand failed")
+
+
+class BrowserMcpCategoryTests(unittest.TestCase):
+    @staticmethod
+    def _schema(name: str) -> dict[str, object]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Browser MCP test tool.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+    def test_browser_mcp_tools_are_added_with_web_category(self) -> None:
+        browser_schema = self._schema("mcp_browser_navigate_page")
+        general_schema = self._schema("mcp_calendar_create_event")
+        manager = SimpleNamespace(
+            tools={
+                "mcp_browser_navigate_page": object(),
+                "mcp_calendar_create_event": object(),
+            },
+            web_control_tool_schemas=Mock(return_value=[browser_schema]),
+            tool_schemas=Mock(return_value=[browser_schema, general_schema]),
+            browser_control_connection_errors=Mock(return_value={}),
+        )
+
+        available = quasar_cli._available_tool_schemas(
+            "dynamic",
+            {"web"},
+            set(),
+            manager,
+        )
+        names = {tool["function"]["name"] for tool in available}
+
+        self.assertIn("mcp_browser_navigate_page", names)
+        self.assertNotIn("mcp_calendar_create_event", names)
+        manager.web_control_tool_schemas.assert_called_once_with()
+
+        integration_tools = quasar_cli._available_tool_schemas(
+            "dynamic",
+            {"integrations"},
+            set(),
+            manager,
+        )
+        integration_names = {
+            tool["function"]["name"] for tool in integration_tools
+        }
+        self.assertNotIn("mcp_browser_navigate_page", integration_names)
+
+    def test_loading_web_category_describes_browser_mcp_tools(self) -> None:
+        manager = SimpleNamespace(
+            web_control_tool_schemas=Mock(
+                return_value=[self._schema("mcp_browser_click")]
+            ),
+            browser_control_connection_errors=Mock(return_value={}),
+        )
+
+        result = quasar_cli._load_tool_categories(
+            ["web"],
+            set(),
+            manager,
+        )
+
+        self.assertIn("mcp_browser_click", result)
+
+    def test_browser_server_is_recognized_from_name_or_tool_set(self) -> None:
+        is_browser = quasar_cli.MCPServerManager._is_browser_control_server
+
+        self.assertTrue(is_browser("chrome", {}))
+        self.assertTrue(
+            is_browser(
+                "automation",
+                {},
+                [{"name": "navigate_page"}, {"name": "take_snapshot"}],
+            )
+        )
+        self.assertFalse(is_browser("calendar", {}, [{"name": "create_event"}]))
+
+    def test_manager_returns_only_tools_from_browser_control_servers(self) -> None:
+        manager = object.__new__(quasar_cli.MCPServerManager)
+        manager._lock = threading.RLock()
+        browser_connection = SimpleNamespace(name="browser")
+        calendar_connection = SimpleNamespace(name="calendar")
+        manager.tools = {
+            "mcp_browser_click": (
+                browser_connection,
+                "click",
+                {"name": "click", "inputSchema": {"type": "object"}},
+            ),
+            "mcp_calendar_add_event": (
+                calendar_connection,
+                "add_event",
+                {"name": "add_event", "inputSchema": {"type": "object"}},
+            ),
+        }
+        manager.browser_control_servers = {"browser"}
+        manager.pending_servers = {}
+        manager.connection_errors = {}
+        manager.connections = {}
+        manager._config = {"mcpServers": {}}
+
+        schemas = manager.web_control_tool_schemas()
+
+        self.assertEqual(
+            [schema["function"]["name"] for schema in schemas],
+            ["mcp_browser_click"],
+        )
+        self.assertEqual(manager.find_tool_schemas("click"), [])
 
 
 if __name__ == "__main__":
