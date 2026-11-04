@@ -100,6 +100,12 @@ class ChatHistoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def delete_all(self) -> int:
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute("DELETE FROM chats")
+                return cursor.rowcount
+
     def get(self, chat_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as connection:
             row = connection.execute(

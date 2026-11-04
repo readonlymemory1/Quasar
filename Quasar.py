@@ -1373,7 +1373,7 @@ class ModelLoader(threading.Thread):
             model_names.update(
                 model.id
                 for model in self.client.models.list().data
-                if self.provider == "ollama"
+                if self.provider in {"ollama", "nvidia_nim"}
                 or model.id.startswith(("gpt-", "o1", "o3", "o4"))
             )
         except Exception as error:
@@ -1670,7 +1670,7 @@ class QuasarDesktopApp(QMainWindow):
         self.menu_button.clicked.connect(self._toggle_radial_menu)
 
         self.provider_selector = QComboBox()
-        self.provider_selector.addItems(("ollama", "openai"))
+        self.provider_selector.addItems(("ollama", "openai", "nvidia_nim"))
         self.provider_selector.setCurrentText(self.provider)
         self.provider_selector.currentTextChanged.connect(self._change_provider)
         self.provider_selector.setToolTip("AI 공급자 선택")
@@ -1908,6 +1908,7 @@ class QuasarDesktopApp(QMainWindow):
         radial_actions = (
             ("새 채팅", self._start_new_chat),
             ("최근 채팅", self._open_recent_chats),
+            ("기록 삭제", self._clear_chat_history),
             ("임시 채팅", self._toggle_temporary_chat),
             ("모델 갱신", self._load_model_options),
             ("설정", self._open_settings),
@@ -2740,6 +2741,53 @@ class QuasarDesktopApp(QMainWindow):
         except (OSError, sqlite3.Error, ValueError) as error:
             self.chat_history_error = str(error)
             self.status_label.setText(f"채팅 기록 저장 오류: {error}")
+
+    def _clear_chat_history(self) -> None:
+        if self.busy:
+            QMessageBox.information(
+                self,
+                "기록 삭제",
+                "응답이 끝난 뒤 채팅 기록을 삭제해 주세요.",
+            )
+            return
+        if self.chat_history_store is None:
+            QMessageBox.warning(
+                self,
+                "기록 삭제",
+                f"채팅 기록 저장소를 사용할 수 없습니다: "
+                f"{self.chat_history_error or '알 수 없는 오류'}",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "채팅 기록 삭제",
+            "저장된 모든 채팅 기록을 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            deleted_count = self.chat_history_store.delete_all()
+        except (OSError, sqlite3.Error, ValueError) as error:
+            self.chat_history_error = str(error)
+            QMessageBox.warning(
+                self,
+                "기록 삭제 실패",
+                f"채팅 기록을 삭제하지 못했습니다: {error}",
+            )
+            return
+
+        self.chat_history_error = None
+        self.current_chat_id = None
+        self.suspended_chat = None
+        if not self.temporary_chat:
+            self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self._clear_chat_view()
+        self.status_label.setText(
+            f"저장된 채팅 기록 {deleted_count}개를 삭제했습니다."
+        )
 
     def _update_chat_mode_ui(self) -> None:
         self.control_core_title.setText(

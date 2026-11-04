@@ -163,8 +163,26 @@ def create_client(provider: str, model_override: str | None = None) -> tuple[Ope
     elif provider == "openai":
         model = model_override or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         client = OpenAI()
+    elif provider == "nvidia_nim":
+        api_key = os.getenv("NVIDIA_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("NVIDIA_API_KEY가 설정되지 않았습니다.")
+        model = model_override or os.getenv(
+            "NVIDIA_NIM_MODEL",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+        )
+        client = OpenAI(
+            api_key=api_key,
+            base_url=os.getenv(
+                "NVIDIA_NIM_BASE_URL",
+                "https://integrate.api.nvidia.com/v1",
+            ),
+        )
     else:
-        raise ValueError(f"지원하지 않는 AI_PROVIDER입니다: {provider}. ollama 또는 openai를 사용하세요.")
+        raise ValueError(
+            f"지원하지 않는 AI_PROVIDER입니다: {provider}. "
+            "ollama, openai 또는 nvidia_nim을 사용하세요."
+        )
     return client, model
 
 
@@ -269,7 +287,7 @@ def is_high_risk_command(command: str) -> bool:
 
 
 def choose_provider(default_provider: str) -> str:
-    providers = ("ollama", "openai")
+    providers = ("ollama", "openai", "nvidia_nim")
     print("\nAI 공급자를 선택하세요:")
     for index, provider in enumerate(providers, start=1):
         marker = " (기본값)" if provider == default_provider else ""
@@ -280,9 +298,9 @@ def choose_provider(default_provider: str) -> str:
             return default_provider
         if choice in providers:
             return choice
-        if choice in {"1", "2"}:
+        if choice in {"1", "2", "3"}:
             return providers[int(choice) - 1]
-        print("1/2 또는 ollama/openai를 입력해 주세요.")
+        print("1/2/3 또는 ollama/openai/nvidia_nim을 입력해 주세요.")
 
 
 def list_ollama_cloud_models() -> list[str]:
@@ -315,7 +333,7 @@ def choose_model(client: OpenAI, provider: str, default_model: str) -> str:
         available_models = sorted(
             model.id
             for model in client.models.list().data
-            if provider == "ollama"
+            if provider in {"ollama", "nvidia_nim"}
             or model.id.startswith(("gpt-", "o1", "o3", "o4"))
         )
     except Exception as error:
@@ -4176,7 +4194,11 @@ def append_pending_collaboration_questions(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Quasar 업무 자동화 CLI 에이전트")
-    parser.add_argument("--provider", choices=("ollama", "openai"), help="AI 공급자 (기본값: AI_PROVIDER 또는 ollama)")
+    parser.add_argument(
+        "--provider",
+        choices=("ollama", "openai", "nvidia_nim"),
+        help="AI 공급자 (기본값: AI_PROVIDER 또는 ollama)",
+    )
     parser.add_argument("--model", help="공급자 모델 이름")
     parser.add_argument("--no-model-prompt", action="store_true", help="시작 시 공급자/모델 선택을 건너뜀")
     parser.add_argument("--cwd", help="시작 작업 디렉터리")
