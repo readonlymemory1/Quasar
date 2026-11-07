@@ -3356,7 +3356,7 @@ TOOLS = [
     tool_schema("remove_mcp_server", "Remove a configured MCP server and immediately close its connection. Requires explicit user approval.", {"server_name": {"type": "string"}}, ["server_name"]),
     tool_schema(
         "message_to_user",
-        "Show a brief live update in the user's chat while a multi-step task is running. Send progress before the first lengthy operation, after each meaningful phase, and before another lengthy wait; do not wait until the final answer. Use error immediately for a blocker and state the recovery you are attempting. Combine quick related actions instead of narrating every tool call. Avoid duplicate updates and quick single-step narration. Keep each message actionable and under 1200 characters.",
+        "Show a brief live update in the user's chat while a multi-step task is running. Send progress before the first lengthy operation, after each meaningful phase, and before another lengthy wait; do not wait until the final answer. Use error immediately for a blocker and state the recovery you are attempting. Combine quick related actions instead of narrating every tool call; the initial announcement of what you are about to do is always welcome. Avoid duplicate updates. Keep each message actionable and under 1200 characters.",
         {
             "message": {"type": "string", "description": "A concise user-facing status, next step, or error and recovery."},
             "kind": {"type": "string", "enum": ["progress", "error"]},

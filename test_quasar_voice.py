@@ -40,18 +40,9 @@ class VoiceWorkerTests(unittest.TestCase):
             "문서에 질문이 있습니다.",
         )
 
-        self.assertEqual(
-            list(app.pending_speech_messages),
-            ["문서에 질문이 있습니다."],
-        )
-        app._speak_response.assert_not_called()
-        app.busy = False
-
-        started = Quasar.QuasarDesktopApp._start_next_pending_speech(app)
-
-        self.assertTrue(started)
-        app._speak_response.assert_called_once_with("문서에 질문이 있습니다.")
+        # 작업이 진행 중이어도 중간 안내는 즉시 음성으로 말한다.
         self.assertEqual(list(app.pending_speech_messages), [])
+        app._speak_response.assert_called_once_with("문서에 질문이 있습니다.")
 
     def test_collaboration_speech_respects_tts_toggle_and_stop_clears_queue(self) -> None:
         class FakeToggle:
@@ -253,7 +244,7 @@ class VoiceWorkerTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0].dtype, np.float32)
         self.assertEqual(captured[0].shape, (16_000,))
-        self.assertTrue(0.06 < float(np.max(captured[0])) < 0.07)
+        self.assertTrue(0.12 < float(np.max(captured[0])) < 0.13)
         self.assertEqual(errors, [])
 
     def test_audio_input_test_plays_processed_microphone_audio(self) -> None:
@@ -291,7 +282,7 @@ class VoiceWorkerTests(unittest.TestCase):
         self.assertEqual(len(recorded), 1)
         self.assertEqual(recorded[0].dtype, np.float32)
         self.assertEqual(recorded[0].shape, (16_000,))
-        self.assertTrue(0.06 < float(np.max(recorded[0])) < 0.07)
+        self.assertTrue(0.12 < float(np.max(recorded[0])) < 0.13)
 
         playback: dict[str, object] = {}
         playback_signals = Quasar.AppSignals()
@@ -388,7 +379,11 @@ class VoiceWorkerTests(unittest.TestCase):
         loud = Quasar.process_voice_input(loud_audio, 16_000)
         silent = Quasar.process_voice_input(silence, 16_000)
 
-        self.assertAlmostEqual(float(np.max(quiet)), 1000 / 32768 * 2, places=6)
+        self.assertAlmostEqual(
+            float(np.max(quiet)),
+            1000 / 32768 * Quasar.VOICE_INPUT_MAX_GAIN,
+            places=6,
+        )
         self.assertAlmostEqual(float(np.max(loud)), 30000 / 32768, places=6)
         self.assertLessEqual(float(np.max(np.abs(loud))), 1.0)
         self.assertEqual(float(np.max(np.abs(silent))), 0.0)

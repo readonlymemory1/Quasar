@@ -12,6 +12,8 @@ qiskit
 qiskit-aer
 numpy
 sounddevice
+faster-whisper
+nvidia-riva-client
 av
 edge-tts
 python-pptx

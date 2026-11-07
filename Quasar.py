@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import csv
+import gc
 import json
 import math
 import os
@@ -94,12 +95,13 @@ SYSTEM_PROMPT = (
     "Follow each tool's own description and arguments. Instructions for one tool or integration apply "
     "only to that tool; do not transfer its workflow, parameters, or guarantees to another tool. "
     "If a required tool is unavailable, say so instead of inventing or substituting a tool. "
-    "STATUS AND COMPLETION: For multi-step work, use message_to_user for a brief progress update before "
-    "the first lengthy operation, after meaningful phases, and before another lengthy wait. Use its "
-    "error kind only when reporting an observed blocker and the recovery being attempted. Combine quick "
-    "related actions; do not narrate simple requests or every tool call. Verify results before claiming "
-    "completion. A command tool's result includes its exit code; inspect it before reporting success or "
-    "starting a dependent command. "
+    "STATUS AND COMPLETION: Whenever the request needs tools, first send one message_to_user that briefly "
+    "states what you understood and are about to do in a short sentence (e.g. '크롬 브라우저를 "
+    "시작하겠습니다.'), then start the work. For multi-step work, continue with brief progress updates "
+    "after meaningful phases and before another lengthy wait. Use message_to_user's error kind only when "
+    "reporting an observed blocker and the recovery being attempted. Do not narrate every tool call; "
+    "combine quick related actions. Verify results before claiming completion. A command tool's result "
+    "includes its exit code; inspect it before reporting success or starting a dependent command. "
     "MCP DIAGNOSTICS: Do not infer that Node.js or npx is missing from an MCP error alone. For an MCP "
     "launch failure, inspect the reported server status and configured command. Before recommending "
     "Node.js installation, test node --version and npx --version in the same environment used by the "
@@ -113,7 +115,13 @@ SYSTEM_PROMPT = (
     "Never enter passwords or secrets or bypass security prompts. Send email only when explicitly "
     "requested; clarify ambiguous sending requests first. "
     "DESKTOP CONTROLS: Use desktop-control tools only during a user-started, time-limited desktop "
-    "session. Their mouse coordinates are normalized from 0 to 1000 against the original screenshot, "
+    "session, and only as a last resort. First try non-desktop alternatives such as browser tools, "
+    "command tools, or file tools; reach for desktop control only when those cannot do the job and "
+    "have failed, or when the user explicitly asks you to move the mouse or control the screen. Do "
+    "not propose desktop control as the first option. Before the first desktop tool, and whenever a "
+    "desktop action reports an inactive or expired session, call desktop_start_session to ask the "
+    "user for approval and then retry; never report a task as impossible merely because the session "
+    "was off. Their mouse coordinates are normalized from 0 to 1000 against the original screenshot, "
     "not pixels or a resized preview. These rules apply only to desktop-control tools. "
     "BROWSER TOOLS: For browser tasks, navigate to the requested page once and continue on the current "
     "page. Do not revisit or reload the same URL unless asked. Before interacting, inspect the page DOM; "
@@ -129,9 +137,47 @@ SYSTEM_PROMPT = (
 NEMO_SPEECH_MODEL = "nemotron-3.5"
 SPEECH_OUTPUT_GAIN = 3.0
 VOICE_RECOGNITION_SAMPLE_RATE = 16_000
-VOICE_INPUT_MAX_GAIN = 2.0
-VOICE_INPUT_TARGET_PEAK = 0.35
+VOICE_LANGUAGE = "ko"
+VOICE_INITIAL_PROMPT = "다음은 한국어로 말한 일상적인 음성입니다. 뜬금없는 단어나 다른 언어를 넣지 말고 들리는 그대로 한국어로 적으세요."
+VOICE_INPUT_MAX_GAIN = 4.0
+VOICE_INPUT_TARGET_PEAK = 0.65
 VOICE_CONVERSATION_END_SILENCE_SECONDS = 0.6
+TRANSCRIPT_CORRECTION_TIMEOUT_SECONDS = 12.0
+VOICE_RESPONSE_SYSTEM_PROMPT = (
+    "[음성 대화 모드 규칙] 지금 답변은 소리 내어 읽어 준다. 다음을 반드시 지켜라.\n"
+    "1. 도구 실행, 화면 제어, 파일 작업 등 동작을 시작하기 전에 "
+    "'크롬 브라우저를 시작하겠습니다.'처럼 한 문장으로 먼저 짧게 알린다.\n"
+    "2. 답변은 1~3문장으로 간결하게. 장황한 설명이나 확인 질문을 덧붙이지 않는다.\n"
+    "3. URL 주소, 링크, 파일 경로, 코드, 표, 나열 기호를 말하지 않는다. "
+    "링크가 필요하면 '링크를 보내드릴게요' 정도로만 말한다.\n"
+    "4. 이모지와 마크다운 기호를 쓰지 않고, 말하기 좋은 자연스러운 문장으로만 답한다."
+)
+TRANSCRIPT_CORRECTION_SYSTEM_PROMPT = (
+    "너는 음성인식(ASR) 문장 교정기다. 입력은 마이크로 말한 한국어 문장을 로컬 "
+    "음성인식 모델이 잘못 기록한 결과다. 소리가 비슷한 올바른 단어로만 바꾸어 "
+    "사용자가 말한 원래 문장을 복원하라.\n"
+    "규칙:\n"
+    "1. 소리가 비슷한 단어만 고친다. 예: '크록 브라우드 켜봐'은 '크롬 브라우저 켜봐'이다.\n"
+    "2. 문맥상 원래 무슨 말이었는지 확실하지 않으면 그 부분은 고치지 않고 그대로 둔다.\n"
+    "3. 새로운 단어를 추가하거나 문장을 다시 쓰지 않는다.\n"
+    "4. 설명하지 말고 교정된 문장 딱 한 줄만 출력한다.\n"
+    "5. 입력에 고칠 오류가 없으면 입력을 그대로 출력한다."
+)
+
+VOICE_ENGINE_NEMO = "nemo"
+VOICE_ENGINE_WHISPER = "whisper"
+VOICE_ENGINE_NIM = "nim"
+VOICE_ENGINE_LABELS = {
+    VOICE_ENGINE_NEMO: "NeMo (nemotron-3.5 로컬 서버)",
+    VOICE_ENGINE_WHISPER: "Whisper (faster-whisper 로컬 모델)",
+    VOICE_ENGINE_NIM: "NVIDIA NIM (whisper-large-v3 클라우드·무료 체험)",
+}
+VOICE_NIM_SERVER = "grpc.nvcf.nvidia.com:443"
+VOICE_NIM_FUNCTION_ID = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"
+VOICE_NIM_API_KEY_ENV = "NVIDIA_API_KEY"
+WHISPER_DEFAULT_MODEL = "small"
+WHISPER_MODEL_CHOICES = ("tiny", "base", "small", "medium", "large-v3")
+WHISPER_SETTINGS_PREFIX = "speech"
 
 
 class _OfficeDocumentSource:
@@ -152,8 +198,10 @@ class AppSignals(QObject):
     models_loaded = Signal(str, object, object)
     voice_status = Signal(str)
     voice_text_ready = Signal(str)
+    voice_text_final = Signal(str)
     voice_failed = Signal(str)
     conversation_voice_text_ready = Signal(str)
+    conversation_voice_text_final = Signal(str)
     conversation_voice_failed = Signal(str)
     speech_finished = Signal(object)
     speech_failed = Signal(object, str)
@@ -294,6 +342,10 @@ class MicrophoneSettingsDialog(QDialog):
         max_tool_rounds: int,
         tool_calling_mode: str,
         desktop_control_seconds: int,
+        recognition_engine: str = VOICE_ENGINE_NEMO,
+        whisper_model: str = WHISPER_DEFAULT_MODEL,
+        transcript_correction_enabled: bool = False,
+        nim_api_key: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -304,6 +356,58 @@ class MicrophoneSettingsDialog(QDialog):
         form = QFormLayout()
         self.microphone_selector = QComboBox()
         form.addRow("입력 마이크", self.microphone_selector)
+        self.engine_selector = QComboBox()
+        for engine in (VOICE_ENGINE_NEMO, VOICE_ENGINE_WHISPER, VOICE_ENGINE_NIM):
+            self.engine_selector.addItem(VOICE_ENGINE_LABELS[engine], engine)
+        engine_index = self.engine_selector.findData(
+            normalize_voice_engine(recognition_engine)
+        )
+        self.engine_selector.setCurrentIndex(max(0, engine_index))
+        self.engine_selector.setToolTip(
+            "음성 입력을 로컬에서 인식할 엔진을 선택합니다."
+        )
+        form.addRow("음성 인식 엔진", self.engine_selector)
+        self.whisper_model_selector = QComboBox()
+        for model_name in WHISPER_MODEL_CHOICES:
+            self.whisper_model_selector.addItem(model_name, model_name)
+        model_index = self.whisper_model_selector.findData(whisper_model)
+        self.whisper_model_selector.setCurrentIndex(max(0, model_index))
+        self.whisper_model_selector.setToolTip(
+            "Whisper 모델 크기. 작을수록 빠르고, 클수록 정확합니다."
+        )
+        form.addRow("Whisper 모델", self.whisper_model_selector)
+        self.nim_api_key_selector = QLineEdit()
+        self.nim_api_key_selector.setEchoMode(QLineEdit.EchoMode.Password)
+        self.nim_api_key_selector.setPlaceholderText(
+            "build.nvidia.com 무료 API 키 (nvapi-...)"
+        )
+        self.nim_api_key_selector.setToolTip(
+            "http://build.nvidia.com 에서 무료로 발급한 API 키를 붙여 넣으세요. "
+            "whisper-large-v3 클라우드 모델로, 가장 정확한 한국어 인식을 제공합니다."
+        )
+        form.addRow("NVIDIA API 키", self.nim_api_key_selector)
+        self.transcript_correction_selector = QCheckBox(
+            "AI로 음성 인식 문장 교정 (한 번 더 모델로 고쳐서 전송)"
+        )
+        self.transcript_correction_selector.setChecked(
+            transcript_correction_enabled
+        )
+        self.transcript_correction_selector.setToolTip(
+            "음성인식 결과에 이상한 단어가 많을 때, 채팅 모델이 소리가 비슷한 "
+            "올바른 단어로 고쳐서 전송합니다. 끄면 인식 결과를 그대로 전송합니다."
+        )
+        form.addRow(self.transcript_correction_selector)
+        self.nim_api_key_selector.setText(nim_api_key)
+        self.engine_status = QLabel()
+        self.engine_status.setWordWrap(True)
+        self.engine_status.setStyleSheet(f"color: {MUTED};")
+        form.addRow(self.engine_status)
+        self.engine_selector.currentIndexChanged.connect(
+            lambda _index: self._update_engine_ui()
+        )
+        self.nim_api_key_selector.textChanged.connect(
+            lambda _text: self._update_engine_ui()
+        )
         self.tool_rounds_selector = QSpinBox()
         self.tool_rounds_selector.setRange(
             agent.MIN_TOOL_ROUNDS,
@@ -395,6 +499,7 @@ class MicrophoneSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.refresh_microphones(selected_device_index)
+        self._update_engine_ui()
 
     @property
     def selected_device_index(self) -> int | None:
@@ -418,6 +523,57 @@ class MicrophoneSettingsDialog(QDialog):
     @property
     def desktop_control_seconds(self) -> int:
         return self.desktop_control_seconds_selector.value()
+
+    @property
+    def recognition_engine(self) -> str:
+        return str(self.engine_selector.currentData())
+
+    @property
+    def whisper_model(self) -> str:
+        return str(self.whisper_model_selector.currentData())
+
+    @property
+    def transcript_correction_enabled(self) -> bool:
+        return self.transcript_correction_selector.isChecked()
+
+    @property
+    def nvidia_api_key(self) -> str:
+        return self.nim_api_key_selector.text().strip()
+
+    def _update_engine_ui(self) -> None:
+        engine = self.recognition_engine
+        self.whisper_model_selector.setEnabled(engine == VOICE_ENGINE_WHISPER)
+        self.nim_api_key_selector.setEnabled(engine == VOICE_ENGINE_NIM)
+        if engine == VOICE_ENGINE_WHISPER:
+            if _faster_whisper_available():
+                self.engine_status.setText(
+                    "Whisper 엔진을 사용할 준비가 되었습니다."
+                )
+            else:
+                self.engine_status.setText(
+                    "faster-whisper가 설치되지 않았습니다. "
+                    "pip install faster-whisper 실행 후 사용하세요."
+                )
+            return
+        if engine == VOICE_ENGINE_NIM:
+            if not _riva_client_available():
+                self.engine_status.setText(
+                    "nvidia-riva-client가 설치되지 않았습니다. "
+                    "pip install nvidia-riva-client 실행 후 사용하세요."
+                )
+                return
+            if self.nvidia_api_key:
+                self.engine_status.setText(
+                    "whisper-large-v3 클라우드 인식을 사용할 준비가 되었습니다."
+                    " (무료 체험: 분당 약 40회 요청)"
+                )
+            else:
+                self.engine_status.setText(
+                    "NVIDIA API 키를 입력해 주세요. build.nvidia.com에서 무료로 "
+                    "발급할 수 있습니다."
+                )
+            return
+        self.engine_status.setText("")
 
     def _toggle_audio_test_recording(self) -> None:
         if self.audio_test_worker is not None and self.audio_test_worker.is_alive():
@@ -569,6 +725,9 @@ class MicrophoneSettingsDialog(QDialog):
                 "사용 가능한 입력 마이크가 없습니다. 연결 후 목록을 새로고침하세요."
             )
 
+    def apply_engine_state(self) -> None:
+        self._update_engine_ui()
+
 
 def find_input_device_index(
     devices: Any,
@@ -591,6 +750,22 @@ def find_input_device_index(
             if fallback_index is None:
                 fallback_index = device_index
     return fallback_index
+
+
+def _faster_whisper_available() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+def _riva_client_available() -> bool:
+    try:
+        import riva.client  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
 
 
 class LocalSpeechRecognizer:
@@ -899,10 +1074,20 @@ class LocalSpeechRecognizer:
 
                 client = self._get_server_client()
                 with audio_path.open("rb") as audio_file:
-                    result = client.audio.transcriptions.create(
-                        model=self.server_model,
-                        file=audio_file,
-                    )
+                    try:
+                        result = client.audio.transcriptions.create(
+                            model=self.server_model,
+                            file=audio_file,
+                            language=VOICE_LANGUAGE,
+                        )
+                    except Exception:
+                        # 서버가 language 파라미터를 지원하지 않으면 최초
+                        # 파라미터 없이 다시 시도한다.
+                        audio_file.seek(0)
+                        result = client.audio.transcriptions.create(
+                            model=self.server_model,
+                            file=audio_file,
+                        )
 
             transcript = result.text.strip()
             transcript = re.sub(r"\s+[a-z]{2,3}-[A-Z]{2,3}\s*$", "", transcript)
@@ -915,11 +1100,396 @@ class LocalSpeechRecognizer:
             signals.voice_text_ready.emit(transcript)
 
 
+class WhisperSpeechRecognizer:
+    """faster-whisper 기반 로컬 음성 인식기.
+
+    NeMo 인식기(LocalSpeechRecognizer)와 동일한 인터페이스를 제공하므로
+    음성 워커들은 인식기 종류를 구분하지 않고 사용할 수 있습니다.
+    """
+
+    def __init__(self, model_name: str = WHISPER_DEFAULT_MODEL) -> None:
+        self.model_name = model_name
+        self.model_lock = threading.Lock()
+        self.model: Any = None
+        self.loaded_model_name: str | None = None
+        self.closed = False
+
+    def start_server(self) -> None:
+        # Whisper는 별도 서버가 필요 없다. 첫 인식 전에 모델을 미리 불러 둔다.
+        with self.model_lock:
+            if self.closed:
+                return
+            if self._has_ready_model():
+                return
+            try:
+                self._load_model()
+            except (ImportError, OSError, RuntimeError, ValueError):
+                # 미리 불러오기에 실패하면 transcribe에서 다시 시도한다.
+                pass
+
+    def _has_ready_model(self) -> bool:
+        return (
+            self.model is not None
+            and self.loaded_model_name == self.model_name
+        )
+
+    def _pick_model_device(self) -> tuple[str, str]:
+        try:
+            import ctranslate2
+
+            if ctranslate2.get_cuda_device_count() > 0:
+                return "cuda", "int8_float16"
+        except Exception:
+            # ctranslate2 임포트 실패 등은 CPU로 진행한다.
+            pass
+        return "cpu", "int8"
+
+    def _load_model(self) -> Any:
+        from faster_whisper import WhisperModel
+
+        # 이전 모델이 남아 있으면 먼저 해제한다. 두 벌이 동시에 잡히면
+        # medium 이상 모델에서 mkl_malloc 메모리 부족이 난다.
+        self.model = None
+        self.loaded_model_name = None
+        gc.collect()
+
+        device, compute_type = self._pick_model_device()
+        try:
+            model = WhisperModel(
+                self.model_name,
+                device=device,
+                compute_type=compute_type,
+            )
+        except (OSError, RuntimeError, MemoryError) as error:
+            detail = f"{type(error).__name__}: {error}"
+            if "memory" in str(error).lower() or isinstance(
+                error,
+                MemoryError,
+            ):
+                raise RuntimeError(
+                    "Whisper 모델을 메모리에 불러오지 못했습니다. 다른 프로그램의 "
+                    "메모리를 줄이거나, 설정에서 더 작은 Whisper 모델을 선택해 "
+                    "주세요. 상세 정보: " + detail
+                ) from error
+            raise
+        self.model = model
+        self.loaded_model_name = self.model_name
+        return model
+
+    def _get_ready_model(self) -> Any:
+        # 이미 불러 둔 같은 이름의 모델은 매 음성 입력마다 다시 만들지 않는다.
+        if self.closed:
+            raise RuntimeError("음성 인식기가 종료되었습니다.")
+        if self._has_ready_model():
+            return self.model
+        try:
+            return self._load_model()
+        except (OSError, RuntimeError, MemoryError) as error:
+            message = str(error)
+            if not isinstance(error, RuntimeError) or "Whisper 모델" not in message:
+                raise RuntimeError(
+                    f"Whisper 모델을 준비하지 못했습니다. {type(error).__name__}: {error}"
+                ) from error
+            raise
+
+    def close(self) -> None:
+        with self.model_lock:
+            self.closed = True
+            self.model = None
+            self.loaded_model_name = None
+
+    def transcribe(
+        self,
+        audio: Any,
+        signals: AppSignals,
+        *,
+        conversation: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        import numpy as np
+
+        with self.model_lock:
+            if self.closed:
+                raise RuntimeError("음성 인식기가 종료되었습니다.")
+            try:
+                signals.voice_status.emit(
+                    "Whisper 모델을 준비하는 중입니다..."
+                )
+                model = self._get_ready_model()
+            except ImportError as error:
+                raise RuntimeError(
+                    "faster-whisper가 설치되지 않았습니다. "
+                    "pip install faster-whisper 를 실행한 뒤 다시 시도해 주세요."
+                ) from error
+
+            signals.voice_status.emit("음성을 Whisper로 인식하는 중입니다...")
+            samples = np.asarray(audio, dtype=np.float32)
+            segments, _info = model.transcribe(
+                samples,
+                language=VOICE_LANGUAGE,
+                beam_size=5,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=250,
+                    speech_pad_ms=40,
+                ),
+                initial_prompt=VOICE_INITIAL_PROMPT,
+            )
+
+            texts: list[str] = []
+            for segment in segments:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("음성 인식 요청이 취소되었습니다.")
+                segment_text = str(segment.text).strip()
+                if segment_text:
+                    texts.append(segment_text)
+            transcript = " ".join(texts)
+            if transcript.startswith(VOICE_INITIAL_PROMPT):
+                transcript = transcript[len(VOICE_INITIAL_PROMPT) :].strip()
+
+        if not transcript:
+            raise RuntimeError(
+                "음성을 인식하지 못했습니다. 다시 말씀해 주세요."
+            )
+        if conversation:
+            signals.conversation_voice_text_ready.emit(transcript)
+        else:
+            signals.voice_text_ready.emit(transcript)
+
+
+def normalize_voice_engine(value: Any) -> str:
+    return value if value in VOICE_ENGINE_LABELS else VOICE_ENGINE_NEMO
+
+
+def create_voice_recognizer(
+    engine: str,
+    whisper_model: str = WHISPER_DEFAULT_MODEL,
+    nim_api_key: str | None = None,
+) -> LocalSpeechRecognizer | WhisperSpeechRecognizer | NimSpeechRecognizer:
+    engine = normalize_voice_engine(engine)
+    if engine == VOICE_ENGINE_WHISPER:
+        return WhisperSpeechRecognizer(whisper_model)
+    if engine == VOICE_ENGINE_NIM:
+        return NimSpeechRecognizer(nim_api_key)
+    return LocalSpeechRecognizer()
+
+
+def _voice_style_messages(
+    app: Any,
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """음성으로 읽어 줄 요청에는 음성 대화 규칙을 시스템 프롬프트에 덧붙인다."""
+    response_toggle = getattr(app, "voice_response_toggle", None)
+    will_be_spoken = bool(
+        getattr(app, "voice_conversation_active", False)
+        or (
+            response_toggle is not None
+            and response_toggle.isChecked()
+        )
+    )
+    if not will_be_spoken:
+        return messages
+    result = list(messages)
+    if result and result[0].get("role") == "system":
+        first = dict(result[0])
+        content = str(first.get("content", ""))
+        if "음성 대화 모드 규칙" not in content:
+            first["content"] = content.rstrip() + "\n\n" + VOICE_RESPONSE_SYSTEM_PROMPT
+        result[0] = first
+    else:
+        result.insert(
+            0,
+            {"role": "system", "content": VOICE_RESPONSE_SYSTEM_PROMPT},
+        )
+    return result
+
+
+class NimSpeechRecognizer:
+    """build.nvidia.com에 호스팅된 whisper-large-v3(NVIDIA NIM) 인식기.
+
+    무료 체험 엔드포인트를 gRPC(Riva 클라이언트)로 호출한다. 모델 자체는
+    클라우드에서 돌아가므로 이 PC의 RAM/CPU는 거의 쓰지 않는다.
+    """
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self.api_key = (api_key or os.getenv(VOICE_NIM_API_KEY_ENV, "") or "").strip()
+        self.model_lock = threading.Lock()
+        self.closed = False
+
+    def start_server(self) -> None:
+        # 외부 호스팅 서버라 미리 준비할 서버는 없고 키 존재만 확인한다.
+        if not self.api_key:
+            raise RuntimeError(
+                "NVIDIA API 키가 설정되지 않았습니다. 설정에서 유효한 API 키를 "
+                f"입력하거나 환경 변수 {VOICE_NIM_API_KEY_ENV}에 지정해 주세요."
+            )
+
+    def close(self) -> None:
+        self.closed = True
+
+    def transcribe(
+        self,
+        audio: Any,
+        signals: AppSignals,
+        *,
+        conversation: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        import numpy as np
+
+        with self.model_lock:
+            if self.closed:
+                raise RuntimeError("음성 인식기가 종료되었습니다.")
+            try:
+                import riva.client
+            except ImportError as error:
+                raise RuntimeError(
+                    "nvidia-riva-client가 설치되지 않았습니다. "
+                    "pip install nvidia-riva-client 를 실행한 뒤 다시 시도해 주세요."
+                ) from error
+            if not self.api_key:
+                raise RuntimeError(
+                    "NVIDIA API 키가 설정되지 않았습니다. 설정에서 유효한 API 키를 "
+                    f"입력하거나 환경 변수 {VOICE_NIM_API_KEY_ENV}에 지정해 주세요."
+                )
+
+            signals.voice_status.emit(
+                "음성을 NVIDIA 클라우드(whisper-large-v3)로 인식하는 중입니다..."
+            )
+            samples = np.asarray(audio, dtype=np.float32)
+            pcm_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+
+            # hosted whisper NIM의 오디오 디코더는 헤더 없는 raw PCM을
+            # 음성으로 인식하지 못한다. 반드시 완전한 WAV 파일을 보낸다.
+            auth = riva.client.Auth(
+                use_ssl=True,
+                uri=VOICE_NIM_SERVER,
+                metadata_args=[
+                    ["function-id", VOICE_NIM_FUNCTION_ID],
+                    ["authorization", f"Bearer {self.api_key}"],
+                ],
+            )
+            service = riva.client.ASRService(auth)
+            config = riva.client.RecognitionConfig(
+                language_code=VOICE_LANGUAGE,
+                max_alternatives=1,
+                enable_automatic_punctuation=True,
+                verbatim_transcripts=True,
+            )
+            with tempfile.TemporaryDirectory(
+                prefix="quasar-nim-",
+            ) as temp_dir:
+                audio_path = Path(temp_dir) / "recording.wav"
+                with wave.open(str(audio_path), "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(VOICE_RECOGNITION_SAMPLE_RATE)
+                    wav_file.writeframes(pcm_samples.tobytes())
+                audio_bytes = audio_path.read_bytes()
+            try:
+                response = service.offline_recognize(audio_bytes, config)
+            except Exception as error:
+                detail = f"{type(error).__name__}: {error}"
+                if "401" in detail or "403" in detail or "AuthContext" in detail:
+                    raise RuntimeError(
+                        "NVIDIA API 키가 거부되었습니다. build.nvidia.com에서 새 "
+                        f"API 키를 발급해 주세요. 상세 정보: {detail}"
+                    ) from error
+                if "RATE_LIMIT" in detail.upper() or "429" in detail:
+                    raise RuntimeError(
+                        "NVIDIA 무료 체험 요청 한도(분당 요청 수)를 초과했습니다. "
+                        f"잠시 후 다시 시도해 주세요. 상세 정보: {detail}"
+                    ) from error
+                raise RuntimeError(f"NVIDIA 클라우드 인식 요청 실패: {detail}") from error
+
+            texts: list[str] = []
+            for result in response.results:
+                for alternative in result.alternatives:
+                    segment_text = str(alternative.transcript).strip()
+                    if segment_text:
+                        texts.append(segment_text)
+            transcript = " ".join(texts)
+            transcript = re.sub(r"\s+[a-z]{2,3}-[A-Z]{2,3}\s*$", "", transcript)
+
+        if not transcript:
+            raise RuntimeError("음성을 인식하지 못했습니다. 다시 말씀해 주세요.")
+        if conversation:
+            signals.conversation_voice_text_ready.emit(transcript)
+        else:
+            signals.voice_text_ready.emit(transcript)
+
+
+class TranscriptCorrectionWorker(threading.Thread):
+    """음성인식 문장을 채팅 모델로 한 번 더 교정하는 워커.
+
+    음성인식이 '크록 브라우드 켜봐'처럼 비슷한 소리의 단어로 잘못 기록하는 것을
+    문맥을 아는 채팅 모델이 '크롬 브라우저 켜봐'로 되살려 준다. 교정에는
+    실패하거나 시간이 초과되면 원문을 그대로 전달한다.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        text: str,
+        signals: AppSignals,
+        *,
+        conversation: bool,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.client = client
+        self.model = model
+        self.text = text
+        self.signals = signals
+        self.conversation = conversation
+
+    def _request(self) -> str | None:
+        messages = [
+            {"role": "system", "content": TRANSCRIPT_CORRECTION_SYSTEM_PROMPT},
+            {"role": "user", "content": self.text},
+        ]
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.0,
+                timeout=TRANSCRIPT_CORRECTION_TIMEOUT_SECONDS,
+            )
+        except TypeError:
+            # timeout 파라미터를 지원하지 않는 클라이언트는 없이 시도한다.
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.0,
+            )
+        choices = list(getattr(response, "choices", []) or [])
+        content = ""
+        if choices:
+            content = str(choices[0].message.content or "")
+        stripped = content.strip().strip("\"'`").strip()
+        return stripped or None
+
+    def run(self) -> None:
+        corrected = self.text
+        try:
+            candidate = self._request()
+        except Exception:
+            candidate = None
+        if candidate:
+            corrected = candidate
+        if self.conversation:
+            self.signals.conversation_voice_text_final.emit(corrected)
+        else:
+            self.signals.voice_text_final.emit(corrected)
+
+
 class VoiceCaptureWorker(threading.Thread):
     def __init__(
         self,
         stop_event: threading.Event,
-        recognizer: LocalSpeechRecognizer,
+        recognizer: LocalSpeechRecognizer | WhisperSpeechRecognizer,
         signals: AppSignals,
         device_index: int | None = None,
     ) -> None:
@@ -990,7 +1560,7 @@ class VoiceConversationCaptureWorker(threading.Thread):
     def __init__(
         self,
         stop_event: threading.Event,
-        recognizer: LocalSpeechRecognizer,
+        recognizer: LocalSpeechRecognizer | WhisperSpeechRecognizer,
         signals: AppSignals,
         device_index: int | None = None,
     ) -> None:
@@ -1294,6 +1864,94 @@ class VoicePlaybackTestWorker(threading.Thread):
             )
             return
         self.signals.audio_test_playback_finished.emit()
+
+
+def synthesize_cosmic_chime(sample_rate: int) -> Any:
+    """별이 빛나는 듯한 짧은 반짝임 효과음(약 1.1초)을 합성한다.
+
+    높은 음역의 유리 질감 종소리가 시간차로 차례로 번쩍이고, 배경에는 아주
+    옅은 고역 실버(은빛) 섬광이 깔린 뒤 빠르게 사라진다.
+    """
+    import numpy as np
+
+    duration = 1.1
+    total = int(sample_rate * duration)
+    t = np.arange(total, dtype=np.float64) / sample_rate
+
+    # 1) 별 반짝임: 높은 음의 글린트(작은 종소리)가 차례로 번쩍인다.
+    glints = np.zeros(total, dtype=np.float64)
+    for start, frequency, amplitude in (
+        (0.00, 1567.98, 0.46),   # G6
+        (0.08, 2093.00, 0.40),   # C7
+        (0.17, 2637.02, 0.32),   # E7
+        (0.28, 3135.96, 0.26),   # G7
+        (0.42, 4186.01, 0.18),   # C8
+    ):
+        local = t - start
+        active = local >= 0
+        if not np.any(active):
+            continue
+        local_active = local[active]
+        attack = np.minimum(local_active / 0.006, 1.0)
+        decay = np.exp(-local_active * 9.0)
+        # 아주 가까운 두 주파수의 맥임으로 유리가 울리는 듯한 결을 만든다.
+        beat = 0.5 * (
+            np.sin(2 * np.pi * frequency * local_active)
+            + np.sin(2 * np.pi * frequency * 1.004 * local_active)
+        )
+        glassy = 0.25 * np.sin(2 * np.pi * frequency * 2.76 * local_active)
+        glints[active] += amplitude * attack * decay * (beat + glassy)
+
+    # 2) 은빛 섬광 배경: 고역 노이즈를 좁게 통과시켜 옅게 깔아 준다.
+    noise = np.random.default_rng(77).standard_normal(total)
+    kernel = np.exp(-np.linspace(-3.0, 3.0, 65) ** 2)
+    kernel = kernel / kernel.sum()
+    noise = np.convolve(noise, kernel, mode="same")
+    high_body = noise - np.convolve(noise, np.ones(33) / 33, mode="same")
+    shimmer = high_body * 0.5 * np.sin(np.pi * np.clip(t / 0.9, 0.0, 1.0)) ** 2
+
+    # 3) 은은한 중역 글로우: 별빛을 받쳐 주는 짧은 잔광.
+    glow = (
+        0.10 * np.sin(2 * np.pi * 783.99 * t)
+        + 0.06 * np.sin(2 * np.pi * 1174.66 * t + 0.5)
+    ) * np.exp(-t * 3.2)
+
+    mixed = glints + shimmer + glow
+    fade_out = np.clip((duration - t) / 0.22, 0.0, 1.0)
+    mixed *= fade_out
+    peak = float(np.max(np.abs(mixed)))
+    if peak > 0:
+        mixed = mixed / peak * 0.45
+    return mixed.astype(np.float32)
+
+
+def play_cosmic_chime_async() -> None:
+    """답변 전송 알림 별빛 효과음을 별도 스트림으로 즉시 재생한다.
+
+    sounddevice의 전역 재생(sd.play)을 쓰면 진행 중인 TTS 음성을 끊기 때문에,
+    독립 OutputStream으로 재생해 TTS와 동시에 울려도 서로 방해하지 않는다.
+    """
+
+    def _play() -> None:
+        try:
+            import sounddevice as sd
+
+            samples = synthesize_cosmic_chime(48_000).reshape(-1, 1)
+            with sd.OutputStream(
+                samplerate=48_000,
+                channels=1,
+                dtype="float32",
+            ) as stream:
+                stream.write(samples)
+        except Exception:
+            # 효과음 재생 실패는 대화에 영향을 주지 않는다.
+            pass
+
+    threading.Thread(
+        target=_play,
+        name="quasar-cosmic-chime",
+        daemon=True,
+    ).start()
 
 
 class LocalSpeechOutputWorker(threading.Thread):
@@ -1767,7 +2425,37 @@ class QuasarDesktopApp(QMainWindow):
         self.request_cancel_event: threading.Event | None = None
         self.request_client: Any = None
         self.last_activity_message: str | None = None
-        self.voice_recognizer = LocalSpeechRecognizer()
+        self.voice_engine = normalize_voice_engine(
+            self.settings.value(
+                "speech/recognition_engine",
+                VOICE_ENGINE_NEMO,
+                type=str,
+            )
+        )
+        self.whisper_model = self.settings.value(
+            "speech/whisper_model",
+            WHISPER_DEFAULT_MODEL,
+            type=str,
+        )
+        if self.whisper_model not in WHISPER_MODEL_CHOICES:
+            self.whisper_model = WHISPER_DEFAULT_MODEL
+        self.nim_api_key = self.settings.value(
+            "speech/nim_api_key",
+            os.getenv(VOICE_NIM_API_KEY_ENV, ""),
+            type=str,
+        )
+        self.nim_api_key = (self.nim_api_key or "").strip()
+        self.voice_recognizer = create_voice_recognizer(
+            self.voice_engine,
+            self.whisper_model,
+            self.nim_api_key,
+        )
+        self.voice_transcript_correction_enabled = self.settings.value(
+            "speech/fix_transcript",
+            False,
+            type=bool,
+        )
+        self.transcript_correction_worker: TranscriptCorrectionWorker | None = None
         self.voice_recording = False
         self.voice_processing = False
         self.voice_stop_event: threading.Event | None = None
@@ -1793,9 +2481,13 @@ class QuasarDesktopApp(QMainWindow):
         self.signals.alarm_triggered.connect(self._show_alarm_notification)
         self.signals.models_loaded.connect(self._apply_model_options)
         self.signals.voice_status.connect(self._show_voice_status)
-        self.signals.voice_text_ready.connect(self._submit_voice_text)
+        self.signals.voice_text_ready.connect(self._correct_voice_text)
+        self.signals.voice_text_final.connect(self._submit_voice_text)
         self.signals.voice_failed.connect(self._finish_voice_error)
         self.signals.conversation_voice_text_ready.connect(
+            self._correct_voice_conversation_text
+        )
+        self.signals.conversation_voice_text_final.connect(
             self._submit_voice_conversation_text
         )
         self.signals.conversation_voice_failed.connect(
@@ -1832,6 +2524,16 @@ class QuasarDesktopApp(QMainWindow):
             self.desktop_control_session = DesktopControlSession()
             self.desktop_control_settings_error = str(error)
         self.desktop_tool_schemas = [
+            agent.tool_schema(
+                "desktop_start_session",
+                "Request user approval to start the time-limited desktop control session. "
+                "Call this before the first desktop tool whenever the session is not active, "
+                "or right after any desktop tool reports an inactive or expired session. "
+                "The user sees an approval prompt; on approval the session starts "
+                "immediately and desktop tools become usable.",
+                {},
+                [],
+            ),
             agent.tool_schema(
                 "desktop_capture",
                 "Capture the current Windows virtual desktop as an image for visual analysis. "
@@ -2407,14 +3109,74 @@ class QuasarDesktopApp(QMainWindow):
         )
     def _create_client(self, provider: str) -> None:
         try:
+            if (
+                provider == "nvidia_nim"
+                and not os.getenv("NVIDIA_API_KEY", "").strip()
+                and getattr(self, "nim_api_key", "").strip()
+            ):
+                # 음성 인식에서 쓰던 NVIDIA API 키를 채팅 공급자로도 재사용한다.
+                os.environ["NVIDIA_API_KEY"] = self.nim_api_key.strip()
             self.client, self.model = agent.create_client(provider)
             self.provider = provider
             self.startup_error = None
+            self._start_model_warmup()
         except Exception as error:
             self.client = None
             self.model = ""
             self.provider = provider
             self.startup_error = str(error)
+
+    def _start_model_warmup(self) -> None:
+        """첫 대화 전에 로컬 모델을 메모리에 미리 올려 둔다.
+
+        ollama 같은 로컬 공급자는 첫 요청 때 모델을 로드하는 데 수십 초가 걸리고,
+        5분간 사용하지 않으면 다시 내렸다가 다음 요청 때 또 로드한다. 앱 시작 직후와
+        4분마다 1토큰짜리 요청을 보내 모델을 항상 준비 상태로 유지한다.
+        """
+        if self.client is None or not self.model:
+            return
+        provider = (self.provider or "").lower()
+        if "ollama" not in provider:
+            # 클라우드 공급자는 모델 로드 지연이 없어서 예열이 필요 없다.
+            return
+        previous_stop = getattr(self, "_model_warmup_stop", None)
+        previous_model = getattr(self, "_model_warmup_model", None)
+        if (
+            previous_stop is not None
+            and not previous_stop.is_set()
+            and previous_model == self.model
+        ):
+            return
+        if previous_stop is not None:
+            previous_stop.set()
+        stop_event = threading.Event()
+        self._model_warmup_stop = stop_event
+        self._model_warmup_model = self.model
+        threading.Thread(
+            target=self._keep_model_warm,
+            args=(self.client, self.model, stop_event),
+            name="quasar-model-warmup",
+            daemon=True,
+        ).start()
+
+    def _keep_model_warm(
+        self,
+        client: Any,
+        model: str,
+        stop_event: threading.Event,
+    ) -> None:
+        while not stop_event.is_set() and not self.closing:
+            try:
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    timeout=60,
+                )
+            except Exception:
+                # 모델 로드 전 실패 등은 다음 주기에 다시 시도한다.
+                pass
+            stop_event.wait(240.0)
 
     def _change_provider(self, provider: str) -> None:
         if self.busy or provider == self.provider:
@@ -2444,6 +3206,7 @@ class QuasarDesktopApp(QMainWindow):
                     "AI 모델이 변경되어 문서 감시를 중지했습니다. 다시 켜 주세요."
                 )
             self.model = model
+            self._start_model_warmup()
 
     def _restore_microphone_selection(self) -> int | None:
         saved_name = self.settings.value(
@@ -2521,6 +3284,10 @@ class QuasarDesktopApp(QMainWindow):
             self.max_tool_rounds,
             self.tool_calling_mode,
             self.desktop_control_seconds,
+            self.voice_engine,
+            self.whisper_model,
+            self.voice_transcript_correction_enabled,
+            self.nim_api_key,
             self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -2581,6 +3348,26 @@ class QuasarDesktopApp(QMainWindow):
             "desktop/control_session_seconds",
             dialog.desktop_control_seconds,
         )
+        self.settings.setValue(
+            "speech/recognition_engine",
+            dialog.recognition_engine,
+        )
+        self.settings.setValue(
+            "speech/whisper_model",
+            dialog.whisper_model,
+        )
+        self.settings.setValue(
+            "speech/nim_api_key",
+            dialog.nvidia_api_key,
+        )
+        self.nim_api_key = dialog.nvidia_api_key
+        self.settings.setValue(
+            "speech/fix_transcript",
+            dialog.transcript_correction_enabled,
+        )
+        self.voice_transcript_correction_enabled = (
+            dialog.transcript_correction_enabled
+        )
         if selected_device is None:
             self.settings.remove("audio/input_device_name")
             self.settings.remove("audio/input_device_host_api")
@@ -2620,9 +3407,46 @@ class QuasarDesktopApp(QMainWindow):
         self.tool_calling_mode_error = None
         self.desktop_control_settings_error = None
         self.microphone_notice = None
-        self.status_label.setText(
-            f"입력 마이크: {dialog.selected_device_name}"
+        self._apply_voice_engine(
+            dialog.recognition_engine,
+            dialog.whisper_model,
+            dialog.nvidia_api_key,
         )
+        engine_label = VOICE_ENGINE_LABELS[dialog.recognition_engine]
+        self.status_label.setText(
+            f"입력 마이크: {dialog.selected_device_name} · {engine_label}"
+        )
+
+    def _apply_voice_engine(
+        self,
+        engine: str,
+        whisper_model: str,
+        nim_api_key: str | None = None,
+    ) -> None:
+        engine = normalize_voice_engine(engine)
+        if whisper_model not in WHISPER_MODEL_CHOICES:
+            whisper_model = WHISPER_DEFAULT_MODEL
+        if nim_api_key is not None:
+            self.nim_api_key = nim_api_key.strip()
+        if (
+            engine == self.voice_engine
+            and whisper_model == self.whisper_model
+            and nim_api_key is None
+        ):
+            return
+        self.voice_engine = engine
+        self.whisper_model = whisper_model
+        previous_recognizer = self.voice_recognizer
+        self.voice_recognizer = create_voice_recognizer(
+            engine,
+            whisper_model,
+            self.nim_api_key,
+        )
+        threading.Thread(
+            target=previous_recognizer.close,
+            name="quasar-asr-cleanup",
+            daemon=True,
+        ).start()
 
     def _load_model_options(self) -> None:
         if self.client is None or self.busy:
@@ -3468,6 +4292,41 @@ class QuasarDesktopApp(QMainWindow):
             return False
         return bool(request["approved"])
 
+    def _handle_desktop_start_session(self) -> str:
+        if self.desktop_control_session.is_active():
+            return (
+                "데스크톱 제어 세션이 이미 활성 상태입니다. "
+                f"남은 시간 {self.desktop_control_session.remaining_seconds()}초."
+            )
+        approved = self._request_tool_approval(
+            "desktop_start_session",
+            {
+                "안내": (
+                    "활성 세션 동안 에이전트가 화면을 관찰하고 "
+                    "마우스·키 입력을 수행할 수 있습니다."
+                ),
+                "제한": (
+                    f"세션은 최대 {self.desktop_control_seconds}초 또는 "
+                    f"{MAX_ACTIONS_PER_SESSION}회 입력 후 자동으로 끝납니다."
+                ),
+            },
+        )
+        if not approved:
+            return (
+                "사용자가 데스크톱 제어 세션 시작을 승인하지 않았습니다. "
+                "데스크톱 조작 없이 가능한 다른 방법을 제안하거나 작업을 중단하세요."
+            )
+        try:
+            self.desktop_control_session.start()
+        except RuntimeError as error:
+            return f"데스크톱 제어 세션 시작 실패: {error}"
+        return (
+            "데스크톱 제어 세션이 시작되었습니다. "
+            f"남은 시간 {self.desktop_control_session.remaining_seconds()}초, "
+            f"세션당 최대 {MAX_ACTIONS_PER_SESSION}회 입력. "
+            "이제 desktop_capture로 화면을 확인한 뒤 작업을 진행하세요."
+        )
+
     def _open_desktop_control(self) -> None:
         existing_dialog = getattr(self, "desktop_control_dialog", None)
         if existing_dialog is not None and existing_dialog.isVisible():
@@ -3523,6 +4382,8 @@ class QuasarDesktopApp(QMainWindow):
             return "메시지를 사용자 채팅에 표시했습니다."
         if name.startswith("desktop_"):
             try:
+                if name == "desktop_start_session":
+                    return self._handle_desktop_start_session()
                 if name == "desktop_capture":
                     return self.desktop_control_session.capture_for_agent()
                 if name == "desktop_move_mouse":
@@ -3544,6 +4405,13 @@ class QuasarDesktopApp(QMainWindow):
                         arguments.get("key")
                     )
             except (OSError, RuntimeError, ValueError) as error:
+                message = str(error)
+                if "활성화되어 있지 않거나 만료" in message:
+                    return (
+                        "데스크톱 제어 세션이 꺼져 있거나 만료되었습니다. 이는 작업 불가가 "
+                        "아니라 세션이 꺼져 있을 뿐입니다. desktop_start_session 도구로 "
+                        "사용자 승인을 요청해 세션을 시작한 뒤 같은 동작을 다시 시도하세요."
+                    )
                 return f"데스크톱 제어 실패: {type(error).__name__}: {error}"
             return f"알 수 없는 데스크톱 제어 도구: {name}"
         if name == "execute_cmd":
@@ -3690,7 +4558,7 @@ class QuasarDesktopApp(QMainWindow):
                 response = agent.request_agent(
                     client,
                     model,
-                    messages,
+                    _voice_style_messages(self, messages),
                     prompt,
                     live_analysis_server=getattr(
                         self,
@@ -3730,10 +4598,10 @@ class QuasarDesktopApp(QMainWindow):
                 )
 
     def _handle_send_button(self) -> None:
-        if self.busy:
-            self._cancel_request()
-        elif self.speech_worker is not None:
+        if self.speech_worker is not None:
             self._stop_speech()
+        elif self.busy:
+            self._cancel_request()
         else:
             self.submit()
 
@@ -3804,6 +4672,48 @@ class QuasarDesktopApp(QMainWindow):
             self.voice_button.setText("음성 인식 중...")
         elif self.voice_recording:
             self.voice_button.setText("듣는 중... 놓으면 전송")
+
+    def _emit_voice_text_final(self, text: str, conversation: bool) -> None:
+        if conversation:
+            self.signals.conversation_voice_text_final.emit(text)
+        else:
+            self.signals.voice_text_final.emit(text)
+
+    def _correct_voice_text(self, text: str) -> None:
+        self._correct_transcript(text, False)
+
+    def _correct_voice_conversation_text(self, text: str) -> None:
+        self._correct_transcript(text, True)
+
+    def _correct_transcript(self, text: str, conversation: bool) -> None:
+        if self.closing:
+            return
+        correction_worker = self.transcript_correction_worker
+        if (
+            not self.voice_transcript_correction_enabled
+            or self.client is None
+            or (
+                correction_worker is not None
+                and correction_worker.is_alive()
+            )
+        ):
+            self._emit_voice_text_final(text, conversation)
+            return
+        try:
+            client, model = agent.create_client(self.provider, self.model)
+        except Exception:
+            self._emit_voice_text_final(text, conversation)
+            return
+        self.signals.voice_status.emit("음성 인식 문장을 교정하는 중...")
+        worker = TranscriptCorrectionWorker(
+            client,
+            model,
+            text,
+            self.signals,
+            conversation=conversation,
+        )
+        self.transcript_correction_worker = worker
+        worker.start()
 
     def _submit_voice_text(self, text: str) -> None:
         if self.closing:
@@ -3946,7 +4856,12 @@ class QuasarDesktopApp(QMainWindow):
 
     def _speak_response(self, response: str) -> bool:
         spoken_text = re.sub(r"```.*?```", "코드 블록", response, flags=re.DOTALL)
+        # 마크다운 링크 [텍스트](주소)는 텍스트만 남기고, 남은 URL은 '링크'로 치환해
+        # 주소를 소리 내어 읽는 일이 없게 한다.
+        spoken_text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", spoken_text)
+        spoken_text = re.sub(r"https?://\S+", " 링크 ", spoken_text)
         spoken_text = re.sub(r"[*_#`>]", "", spoken_text).strip()
+        spoken_text = re.sub(r"\s{2,}", " ", spoken_text)
         if not spoken_text:
             return False
         self.status_label.setText("음성 출력을 시작하고 있습니다...")
@@ -3965,7 +4880,10 @@ class QuasarDesktopApp(QMainWindow):
     def _queue_collaboration_speech(self, message: str) -> None:
         if (
             self.closing
-            or not self.voice_response_toggle.isChecked()
+            or not (
+                self.voice_response_toggle.isChecked()
+                or bool(getattr(self, "voice_conversation_active", False))
+            )
             or not message.strip()
         ):
             return
@@ -3973,10 +4891,13 @@ class QuasarDesktopApp(QMainWindow):
         self._start_next_pending_speech()
 
     def _start_next_pending_speech(self) -> bool:
-        if self.closing or not self.voice_response_toggle.isChecked():
+        if self.closing or not (
+            self.voice_response_toggle.isChecked()
+            or bool(getattr(self, "voice_conversation_active", False))
+        ):
             self.pending_speech_messages.clear()
             return False
-        if self.busy or self.speech_worker is not None:
+        if self.speech_worker is not None:
             return False
         while self.pending_speech_messages:
             message = self.pending_speech_messages.popleft()
@@ -3992,8 +4913,8 @@ class QuasarDesktopApp(QMainWindow):
         self.speech_worker = None
         self.pending_speech_messages.clear()
         worker.stop()
+        self.send_button.setText("중지" if self.busy else "전송")
         if not self.busy:
-            self.send_button.setText("전송")
             self.send_button.setEnabled(True)
         self.status_label.setText("음성 출력을 중지했습니다.")
         if self.voice_conversation_active:
@@ -4003,14 +4924,15 @@ class QuasarDesktopApp(QMainWindow):
             self._start_voice_conversation_capture()
 
     def _finish_speech(self, worker: LocalSpeechOutputWorker) -> None:
-        if self.closing or self.busy:
-            return
-        if worker is not self.speech_worker:
+        if self.closing or worker is not self.speech_worker:
             return
         self.speech_worker = None
-        self.send_button.setText("전송")
+        self.send_button.setText("중지" if self.busy else "전송")
         self.send_button.setEnabled(True)
         if self._start_next_pending_speech():
+            return
+        if self.busy:
+            # 요청이 아직 진행 중이면 대화 재개는 응답 완료 후에 한다.
             return
         if self.voice_conversation_active:
             self._start_voice_conversation_capture()
@@ -4053,6 +4975,7 @@ class QuasarDesktopApp(QMainWindow):
             else message
         )
         self._add_message("assistant", content)
+        self._queue_collaboration_speech(message)
 
     def _show_alarm_notification(self, message: str) -> None:
         if self.closing:
@@ -4092,6 +5015,10 @@ class QuasarDesktopApp(QMainWindow):
         self._clear_request_state()
         self._add_message("assistant", response)
         self._set_busy(False)
+        if self.voice_conversation_active:
+            # 답변이 채팅에 전송되는 순간 우주 효과음을 울린다.
+            # TTS 음성은 이후 합성이 끝나는 대로 따로 재생된다.
+            play_cosmic_chime_async()
         if self.voice_response_toggle.isChecked():
             if self._speak_response(response):
                 return
@@ -4104,6 +5031,7 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self._clear_request_state()
+        self.pending_speech_messages.clear()
         self._add_message("assistant", f"요청 처리 실패: {error}")
         self._set_busy(False)
         if self._start_next_pending_speech():
@@ -4115,6 +5043,7 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             return
         self._clear_request_state()
+        self.pending_speech_messages.clear()
         self.status_label.setText("응답 생성을 중지했습니다.")
         self._set_busy(False)
         if self._start_next_pending_speech():

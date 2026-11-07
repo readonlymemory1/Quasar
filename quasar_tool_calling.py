@@ -55,8 +55,11 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
     ),
     "web": (
         "웹",
-        "공개 웹 검색, Chrome에서 페이지 열기·탭 전환·탐색, 페이지 클릭·입력·스크롤·키 입력, "
-        "화면 캡처, 브라우저 제어 MCP 도구. 페이지 조작 전 DOM을 확인하고 결과를 검증하세요.",
+        "크롬 브라우저를 직접 켜고(실행하고) 닫을 수 있습니다. 공개 웹 검색, "
+        "Chrome에서 페이지 열기·탭 전환·탐색, 페이지 클릭·입력·스크롤·키 입력, "
+        "화면 캡처, 브라우저 제어 MCP 도구. '크롬 켜줘', '브라우저 열어줘'처럼 "
+        "브라우저 자체를 여는 요청도 이 카테고리로 처리합니다. "
+        "페이지 조작 전 DOM을 확인하고 결과를 검증하세요.",
         frozenset({
             "web_search",
             "web_navigate",
@@ -76,10 +79,12 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
         "사용자가 Quasar 설정에서 정한 10~300초 시간과 Quasar 데스크톱 제어 창에서 "
         "명시적으로 시작한 세션 안에서만 "
         "화면 캡처, 좌표 마우스 이동·왼쪽 클릭, 문자 입력, 제한된 키 입력을 수행합니다. "
+        "세션이 꺼져 있으면 먼저 desktop_start_session으로 사용자 승인을 요청하세요. "
         "세션은 40회 동작으로 제한되며 화면 미리보기에서 언제든 중지할 수 있습니다. "
         "화면 캡처는 사용자가 요청했을 때 모델에 전송됩니다. 비밀번호 입력이나 "
         "사용자 확인이 필요한 최종 제출·삭제·구매 등은 수행하지 마세요.",
         frozenset({
+            "desktop_start_session",
             "desktop_capture",
             "desktop_move_mouse",
             "desktop_click",

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>간단한 파쿠르 게임</title>
+<style>
+  body { margin: 0; background: #1a1a2e; font-family: Arial, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; color: white; }
+  canvas { background: #16213e; border: 4px solid #0f3460; border-radius: 8px; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+  .controls { margin-top: 12px; text-align: center; font-size: 14px; color: #aaa; }
+  .controls b { color: #e94560; }
+  .hud { position: absolute; top: 20px; left: 20px; font-size: 18px; color: #fff; text-shadow: 2px 2px 4px rgba(0,0,0,0.5); }
+  .msg { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; display: none; }
+  .msg h1 { margin: 0; font-size: 48px; color: #e94560; }
+  .msg p { margin: 10px 0 20px; font-size: 20px; color: #fff; }
+  button { padding: 10px 20px; font-size: 16px; background: #e94560; color: white; border: none; border-radius: 5px; cursor: pointer; }
+  button:hover { background: #ff6b6b; }
+</style>
+</head>
+<body>
+<div class="hud">플랫폼: <span id="platforms">0</span> | 점프: <span id="jumps">0</span></div>
+<div class="msg" id="msg">
+  <h1 id="msgTitle">게임 클리어!</h1>
+  <p id="msgText">축하합니다!</p>
+  <button onclick="resetGame()">다시 시작</button>
+</div>
+<canvas id="gameCanvas" width="800" height="450"></canvas>
+<div class="controls">
+  ← → 이동 &nbsp;|&nbsp; ↑ 또는 Space 점프 &nbsp;|&nbsp; 목표: 빨간 깃발에 도달하세요
+</div>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const platformCountEl = document.getElementById('platforms');
+const jumpCountEl = document.getElementById('jumps');
+const msgEl = document.getElementById('msg');
+const msgTitle = document.getElementById('msgTitle');
+const msgText = document.getElementById('msgText');
+
+// 게임 상태
+let player = { x: 50, y: 350, w: 30, h: 30, vx: 0, vy: 0, speed: 5, jumpForce: -12, grounded: false, color: '#00d2ff' };
+let gravity = 0.6;
+let friction = 0.8;
+let keys = {};
+let platforms = [];
+let goal = { x: 730, y: 300, w: 20, h: 80 };
+let jumps = 0;
+let gameOver = false;
+
+// 레벨 디자인 (플랫폼: x, y, w, h)
+const level = [
+  {x: 0, y: 400, w: 800, h: 50},      // 바닥
+  {x: 100, y: 340, w: 120, h: 20},    // 플랫폼 1
+  {x: 260, y: 280, w: 120, h: 20},    // 플랫폼 2
+  {x: 420, y: 320, w: 120, h: 20},    // 플랫폼 3
+  {x: 580, y: 260, w: 120, h: 20},    // 플랫폼 4
+  {x: 720, y: 300, w: 20, h: 100},    // 목표 기둥 (빨간 깃발)
+];
+
+function init() {
+  platforms = [];
+  for (let p of level) {
+    platforms.push({x: p.x, y: p.y, w: p.w, h: p.h, color: p.x >= 720 ? '#e94560' : '#4a90e2'});
+  }
+  player.x = 50;
+  player.y = 350;
+  player.vx = 0;
+  player.vy = 0;
+  jumps = 0;
+  gameOver = false;
+  msgEl.style.display = 'none';
+  updateHUD();
+}
+
+function updateHUD() {
+  platformCountEl.textContent = platforms.length;
+  jumpCountEl.textContent = jumps;
+}
+
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space' || e.code === 'ArrowUp') {
+    if (player.grounded) {
+      player.vy = player.jumpForce;
+      player.grounded = false;
+      jumps++;
+      updateHUD();
+    }
+  }
+});
+
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+});
+
+function update() {
+  if (gameOver) return;
+
+  // 이동
+  if (keys['ArrowLeft']) player.vx -= player.speed;
+  if (keys['ArrowRight']) player.vx += player.speed;
+
+  // 마찰
+  player.vx *= friction;
+
+  // 중력
+  player.vy += gravity;
+
+  // 위치 업데이트
+  player.x += player.vx;
+  player.y += player.vy;
+
+  // 바닥/플랫폼 충돌
+  player.grounded = false;
+  for (let p of platforms) {
+    if (player.x < p.x + p.w &&
+        player.x + player.w > p.x &&
+        player.y < p.y + p.h &&
+        player.y + player.h > p.y) {
+      
+      // 위에서 떨어졌을 때
+      if (player.vy > 0 && player.y + player.h - player.vy <= p.y + 5) {
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.grounded = true;
+      }
+      // 아래에서 부딪혔을 때
+      else if (player.vy < 0 && player.y - player.vy >= p.y + p.h - 5) {
+        player.y = p.y + p.h;
+        player.vy = 0;
+      }
+      // 옆에서 부딪혔을 때
+      else if (player.vx > 0) {
+        player.x = p.x - player.w;
+        player.vx = 0;
+      } else if (player.vx < 0) {
+        player.x = p.x + p.w;
+        player.vx = 0;
+      }
+    }
+  }
+
+  // 화면 밖 제한
+  if (player.x < 0) player.x = 0;
+  if (player.x + player.w > canvas.width) player.x = canvas.width - player.w;
+  if (player.y > canvas.height) {
+    // 떨어지면 리셋
+    player.x = 50;
+    player.y = 350;
+    player.vx = 0;
+    player.vy = 0;
+  }
+
+  // 목표 도달 체크
+  if (player.x < goal.x + goal.w &&
+      player.x + player.w > goal.x &&
+      player.y < goal.y + goal.h &&
+      player.y + player.h > goal.y) {
+    gameOver = true;
+    msgTitle.textContent = '게임 클리어! 🎉';
+    msgText.textContent = `점프 횟수: ${jumps}회`;
+    msgEl.style.display = 'block';
+  }
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // 플랫폼 그리기
+  for (let p of platforms) {
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, p.w, p.h);
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.strokeRect(p.x, p.y, p.w, p.h);
+  }
+
+  // 목표 깃발
+  ctx.fillStyle = '#e94560';
+  ctx.fillRect(goal.x, goal.y, goal.w, 10); // 깃대 윗부분
+  ctx.fillRect(goal.x, goal.y + 10, 5, goal.h - 10);
+  ctx.fillStyle = '#ff4757';
+  ctx.fillRect(goal.x + 5, goal.y + 5, 15, 20); // 깃발
+
+  // 플레이어
+  ctx.fillStyle = player.color;
+  ctx.fillRect(player.x, player.y, player.w, player.h);
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(player.x, player.y, player.w, player.h);
+
+  // 안내 텍스트
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.font = '16px Arial';
+  ctx.fillText('START', 55, 345);
+  ctx.fillText('GOAL 🚩', goal.x - 10, goal.y - 10);
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function resetGame() {
+  init();
+}
+
+init();
+loop();
+</script>
+</body>
+</html>
