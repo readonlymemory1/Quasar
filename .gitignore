@@ -1,13 +1,12 @@
+# 비밀값 / 로컬 설정 (예시 파일은 config/ 참고)
 .env
 .mcp.json
+
+# 실행 중 생성되는 데이터 / 캐시
 .quasar/
-todolist.sqlite3
-todolist.sqlite3-shm
-todolist.sqlite3-wal
-todolist_desktop/__pycache__/
-todolist_desktop/build/
-todolist_desktop/*.spec
-todolist_desktop/QuasarTodo.exe
-vscode_extension/*.vsix
-"Quasar.py" 
-__pycache__/ 
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/*.sqlite3-journal
+__pycache__/
+*.py[cod]
