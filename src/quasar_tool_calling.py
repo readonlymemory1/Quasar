@@ -16,7 +16,9 @@ CATEGORY_DETAILS: dict[str, tuple[str, str, frozenset[str]]] = {
         "코드",
         "Python 파일 목록 조회·읽기, 문법 검사·실행, 코드 파일 생성·수정, 작업 폴더에서 명령 실행. "
         "수정 전 반드시 읽고 "
-        "정확한 기존 내용을 expected_source로 전달하세요. 실행 또는 시스템 명령은 승인 후에만 수행합니다.",
+        "정확한 기존 내용을 expected_source로 전달하세요. 조회·빌드 같은 일반 명령은 승인 없이 "
+        "바로 실행하고, 삭제·덮어쓰기·강제 푸시·시스템 설정 변경처럼 되돌리기 어려운 명령만 "
+        "실행 전 승인을 받습니다.",
         frozenset({
             "python_list_files",
             "python_read_file",

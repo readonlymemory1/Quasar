@@ -61,6 +61,32 @@ class ToolContextRoutingTests(unittest.TestCase):
             "hello", "progress"
         )
 
+    def test_execute_cmd_approval_shows_the_command_text(self) -> None:
+        captured = {}
+
+        class CaptureSignal:
+            def emit(self, _name, details, request):
+                captured["details"] = details
+                request["approved"] = True
+                request["event"].set()
+
+        session = SimpleNamespace(
+            signals=SimpleNamespace(
+                tool_approval_requested=CaptureSignal(),
+            )
+        )
+        owner = SimpleNamespace(_tool_context=threading.local())
+        owner._tool_context.session = session
+
+        result = Quasar.QuasarDesktopApp._request_tool_approval(
+            owner,
+            "execute_cmd",
+            {"command": "rm -rf build"},
+        )
+
+        self.assertTrue(result)
+        self.assertIn("rm -rf build", captured["details"])
+
     def test_request_tool_approval_routes_to_context_session(self) -> None:
         approved = {}
 

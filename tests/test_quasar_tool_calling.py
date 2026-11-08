@@ -301,6 +301,51 @@ class HighRiskCommandApprovalTests(unittest.TestCase):
                 "done",
             )
 
+    def test_read_only_git_and_dir_commands_do_not_require_approval(self) -> None:
+        for command in (
+            "dir",
+            "dir /b",
+            "git status",
+            "git log --oneline",
+            "git diff",
+            "git add .",
+            "git log > log.txt",
+            "echo hi > out.txt",
+            "python --version",
+        ):
+            with self.subTest(command=command):
+                with (
+                    patch.object(quasar_cli, "auto_approve_commands", True),
+                    patch.object(
+                        quasar_cli,
+                        "tool_approval_callback",
+                        side_effect=AssertionError,
+                    ),
+                    patch.object(
+                        quasar_cli, "execute_cmd", return_value="done"
+                    ),
+                ):
+                    self.assertEqual(
+                        quasar_cli.run_tool(
+                            "execute_cmd", {"command": command}
+                        ),
+                        "done",
+                    )
+
+    def test_destructive_commands_still_require_approval(self) -> None:
+        for command in (
+            "git push --force",
+            "git push -f origin main",
+            "git clean -fd",
+            "git reset --hard HEAD",
+            "rm -rf build",
+            "del report.txt",
+            "Remove-Item -Recurse C:\\temp",
+            "taskkill /f /im app.exe",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(quasar_cli.is_high_risk_command(command))
+
     def test_command_waits_and_returns_complete_output(self) -> None:
         captured_log_path: Path | None = None
 
@@ -342,6 +387,72 @@ class HighRiskCommandApprovalTests(unittest.TestCase):
             result = quasar_cli.execute_cmd("npx tool")
 
         self.assertEqual(result, "실행 실패 (코드 7):\ncommand failed")
+
+
+class CommandActivityLabelTests(unittest.TestCase):
+    def test_execute_cmd_label_includes_command(self) -> None:
+        label = quasar_cli._tool_status_label(
+            "execute_cmd", None, {"command": "git status"}
+        )
+        self.assertEqual(label, "git status")
+
+    def test_execute_cmd_label_without_command(self) -> None:
+        self.assertEqual(
+            quasar_cli._tool_status_label("execute_cmd", None, {}),
+            "명령 실행",
+        )
+
+    def test_execute_cmd_label_is_truncated(self) -> None:
+        label = quasar_cli._tool_status_label(
+            "execute_cmd", None, {"command": "x" * 300}
+        )
+        self.assertLessEqual(len(label), 120)
+        self.assertTrue(label.endswith("..."))
+
+    def test_other_tools_keep_generic_label(self) -> None:
+        self.assertEqual(
+            quasar_cli._tool_status_label("todo_list", None), "todo_list"
+        )
+
+    def test_request_progress_reports_the_executed_command(self) -> None:
+        run_call = chat_tool_call(
+            "execute_cmd", '{"command":"git status"}'
+        )
+        responses = iter([
+            chat_tool_response(run_call),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="완료", tool_calls=[])
+                    )
+                ]
+            ),
+        ])
+        create = Mock(side_effect=lambda **_kwargs: next(responses))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create)
+            )
+        )
+        progress: list[str] = []
+
+        with (
+            patch.object(quasar_cli, "is_responses_model", return_value=False),
+            patch.object(quasar_cli, "run_tool", return_value="ok"),
+            patch("sys.stdout"),
+        ):
+            quasar_cli.request_agent(
+                client,
+                "test-model",
+                [],
+                "git 상태 확인",
+                progress_callback=progress.append,
+            )
+
+        self.assertTrue(
+            any("git status" in message for message in progress),
+            progress,
+        )
 
 
 class BrowserMcpCategoryTests(unittest.TestCase):

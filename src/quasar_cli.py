@@ -301,23 +301,33 @@ def _confirm_tool_action(name: str, arguments: dict[str, Any]) -> bool:
     return approval in {"y", "yes"}
 
 
+# 진짜 위험한(되돌리기 어렵거나 시스템을 바꾸는) 명령만 승인 대상으로 둔다.
+# dir, git status, git log처럼 조회성 명령과 단순 파일 쓰기(>, Set-Content)는
+# 승인 없이 실행해 불필요한 승인 창을 띄우지 않는다.
 HIGH_RISK_COMMAND_PATTERN = re.compile(
     r"(?i)(?:^|[;&|()\s])(?:"
-    r"rm|rmdir|rd|ri|del|erase|remove-item|clear-content|set-content|out-file|"
-    r"move-item|format|diskpart|shutdown|restart-computer|stop-computer|"
+    r"rm|rmdir|rd|ri|del|erase|remove-item|clear-content|"
+    r"format|diskpart|bcdedit|"
+    r"shutdown|restart-computer|stop-computer|logoff|"
     r"set-executionpolicy|reg\s+(?:add|delete)|sc\s+(?:delete|config)|"
-    r"bcdedit|netsh|takeown|icacls|schtasks|net\s+user|"
-    r"git\s+(?:clean|restore|reset\s+--hard|push\s+.*--force)|"
-    r"docker\s+system\s+prune|chmod\s+-R|chown\s+-R|taskkill"
+    r"netsh|takeown|icacls|schtasks|net\s+user|taskkill|"
+    r"docker\s+system\s+prune|chmod\s+-R|chown\s+-R|"
+    r"git\s+(?:clean|restore|reset\s+--hard|branch\s+-D)"
     r")(?:$|[;&|()\s])"
+)
+
+# git push의 강제 옵션은 띄어쓰기 위치가 자유로워 따로 검사한다.
+FORCE_PUSH_PATTERN = re.compile(
+    r"(?i)git\s+push\b.*(?:--force(?:-with-lease)?|(?:^|\s)-f(?:\s|$))"
 )
 
 
 def is_high_risk_command(command: str) -> bool:
-    return bool(
-        HIGH_RISK_COMMAND_PATTERN.search(command)
-        or re.search(r"(?<![<])>{1,2}\s*\S", command)
-    )
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if HIGH_RISK_COMMAND_PATTERN.search(command):
+        return True
+    return bool(FORCE_PUSH_PATTERN.search(command))
 
 
 def choose_provider(default_provider: str) -> str:
@@ -3694,19 +3704,37 @@ def run_tool(
     return f"알 수 없는 도구: {name}"
 
 
-def _tool_status_label(name: str, mcp_manager: MCPServerManager | None) -> str:
+def _tool_status_label(
+    name: str,
+    mcp_manager: MCPServerManager | None,
+    arguments: dict[str, Any] | None = None,
+) -> str:
     if name == "message_to_user":
         return "사용자 메시지 전송"
     if name == "discover_mcp_tools":
         return "Searching MCP tools"
+    if name == "execute_cmd":
+        # 진행 표시가 "도구 실행 중: <명령어>"로 보이도록 명령 원문을 그대로 쓴다.
+        if isinstance(arguments, dict):
+            command = arguments.get("command")
+            if isinstance(command, str) and command.strip():
+                command_text = " ".join(command.split())
+                if len(command_text) > 120:
+                    command_text = command_text[:117] + "..."
+                return command_text
+        return "명령 실행"
     if mcp_manager is not None and name in mcp_manager.tools:
         connection, original_name, _ = mcp_manager.tools[name]
         return f"{connection.name}.{original_name}"
     return name
 
 
-def print_tool_status(name: str, mcp_manager: MCPServerManager | None) -> None:
-    label = _tool_status_label(name, mcp_manager)
+def print_tool_status(
+    name: str,
+    mcp_manager: MCPServerManager | None,
+    arguments: dict[str, Any] | None = None,
+) -> None:
+    label = _tool_status_label(name, mcp_manager, arguments)
     print(f"Using tool: {label}", flush=True)
 
 
@@ -4120,8 +4148,22 @@ def request_agent(
                     "content": result,
                 })
                 continue
-            print_tool_status(tool_call.function.name, mcp_manager)
-            tool_label = _tool_status_label(tool_call.function.name, mcp_manager)
+            label_arguments: dict[str, Any] = {}
+            if tool_call.function.name == "execute_cmd":
+                try:
+                    parsed_label_arguments = json.loads(
+                        tool_call.function.arguments or "{}"
+                    )
+                    if isinstance(parsed_label_arguments, dict):
+                        label_arguments = parsed_label_arguments
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    label_arguments = {}
+            print_tool_status(
+                tool_call.function.name, mcp_manager, label_arguments
+            )
+            tool_label = _tool_status_label(
+                tool_call.function.name, mcp_manager, label_arguments
+            )
             if progress_callback is not None:
                 progress_label = (
                     "MCP 도구 검색"
@@ -4308,8 +4350,20 @@ def request_agent_with_responses(
                     ),
                 })
                 continue
-            print_tool_status(tool_call.name, mcp_manager)
-            tool_label = _tool_status_label(tool_call.name, mcp_manager)
+            label_arguments: dict[str, Any] = {}
+            if tool_call.name == "execute_cmd":
+                try:
+                    parsed_label_arguments = json.loads(
+                        tool_call.arguments or "{}"
+                    )
+                    if isinstance(parsed_label_arguments, dict):
+                        label_arguments = parsed_label_arguments
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    label_arguments = {}
+            print_tool_status(tool_call.name, mcp_manager, label_arguments)
+            tool_label = _tool_status_label(
+                tool_call.name, mcp_manager, label_arguments
+            )
             if progress_callback is not None:
                 progress_label = (
                     "MCP 도구 검색"

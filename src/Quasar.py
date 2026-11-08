@@ -4813,7 +4813,15 @@ class QuasarDesktopApp(QMainWindow):
     ) -> bool:
         event = threading.Event()
         request = {"event": event, "approved": False}
-        details = json.dumps(arguments, ensure_ascii=False, indent=2, default=str)
+        command = arguments.get("command") if name == "execute_cmd" else None
+        if isinstance(command, str) and command.strip():
+            # 승인 창에서 어떤 명령어인지 한눈에 보이도록 원문을 그대로 보여 준다.
+            working_directory = getattr(agent, "current_directory", "")
+            details = f"{working_directory}> {command}"
+        else:
+            details = json.dumps(
+                arguments, ensure_ascii=False, indent=2, default=str
+            )
         if len(details) > 4000:
             details = details[:4000] + "\n... (나머지 생략)"
         _session_for_tool_context(self).signals.tool_approval_requested.emit(
@@ -4892,10 +4900,21 @@ class QuasarDesktopApp(QMainWindow):
         if self.closing:
             event.set()
             return
+        if name == "execute_cmd":
+            message = (
+                "다음 명령어를 실행할까요?\n\n"
+                f"{details}\n\n"
+                "삭제·덮어쓰기 등 되돌리기 어려운 작업일 수 있습니다."
+            )
+        else:
+            message = (
+                f"도구 '{name}'이(가) 다음 작업을 요청했습니다.\n\n"
+                f"{details}\n\n실행할까요?"
+            )
         answer = QMessageBox.warning(
             self,
             "위험 작업 승인",
-            f"도구 '{name}'이(가) 다음 작업을 요청했습니다.\n\n{details}\n\n실행할까요?",
+            message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -6377,10 +6396,21 @@ class TaskWindow(QMainWindow):
             return
         self.raise_()
         self.activateWindow()
+        if name == "execute_cmd":
+            message = (
+                "다음 명령어를 실행할까요?\n\n"
+                f"{details}\n\n"
+                "삭제·덮어쓰기 등 되돌리기 어려운 작업일 수 있습니다."
+            )
+        else:
+            message = (
+                f"도구 '{name}'이(가) 다음 작업을 요청했습니다.\n\n"
+                f"{details}\n\n실행할까요?"
+            )
         answer = QMessageBox.warning(
             self,
             "위험 작업 승인",
-            f"도구 '{name}'이(가) 다음 작업을 요청했습니다.\n\n{details}\n\n실행할까요?",
+            message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
